@@ -1,8 +1,14 @@
 <script setup>
 import { ref, reactive, onMounted, computed } from 'vue'
 
-const API_BASE = window.location.hostname ? `http://${window.location.hostname}:8081/api` : 'http://localhost:8081/api'
-const MEDIA_BASE = window.location.hostname ? `http://${window.location.hostname}:8081/media` : 'http://localhost:8081/media'
+// Same-origin, relative paths - nginx.conf proxies /api and /media to the
+// backend container. This works unmodified whether the frontend is served
+// from localhost:3000 (docker-compose) or a real HTTPS domain (EasyPanel/any
+// reverse-proxy host): the old hardcoded `http://<hostname>:8081` broke the
+// moment the frontend moved behind HTTPS/a domain with no port 8081 exposed
+// (browsers block that as mixed content) or a different backend hostname.
+const API_BASE = '/api'
+const MEDIA_BASE = '/media'
 
 // State variables
 const currentTab = ref('channels') // 'channels', 'calendar', 'settings'

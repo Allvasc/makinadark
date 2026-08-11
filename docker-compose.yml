@@ -31,10 +31,13 @@ services:
     restart: always
     ports:
       - "8081:8080"
-    # All secrets (OPENAI_API_KEY, GEMINI_API_KEY, ELEVENLABS_API_KEY, etc.) live
-    # only in backend/.env - do not duplicate them here as plain env vars.
-    env_file:
-      - ./backend/.env
+    # Secrets are NOT baked into this file or the image - they're substituted
+    # from the environment docker-compose itself runs in. Locally, run:
+    #   docker compose --env-file backend/.env up -d --build
+    # (backend/.env already has every key below, gitignored, never committed).
+    # On EasyPanel, paste the same key=value pairs into the Compose service's
+    # "Environment" tab - EasyPanel writes them to its own .env next to this
+    # file before running compose, so the exact same substitution applies.
     environment:
       - PORT=8080
       - POSTGRES_HOST=postgres
@@ -42,6 +45,26 @@ services:
       - POSTGRES_PASSWORD=makinadark
       - POSTGRES_DB=makinadark
       - IMAGE_RANKER_URL=http://image-ranker:8500
+      - JWT_SECRET=${JWT_SECRET}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - POLLINATIONS_API_KEY=${POLLINATIONS_API_KEY}
+      - PEXELS_API_KEY=${PEXELS_API_KEY}
+      - SHOTSTACK_API_KEY=${SHOTSTACK_API_KEY}
+      - YOUTUBE_CLIENT_ID=${YOUTUBE_CLIENT_ID}
+      - YOUTUBE_CLIENT_SECRET=${YOUTUBE_CLIENT_SECRET}
+      - TIKTOK_CLIENT_ID=${TIKTOK_CLIENT_ID}
+      - TIKTOK_CLIENT_SECRET=${TIKTOK_CLIENT_SECRET}
+      - REDIRECT_URI=${REDIRECT_URI}
+      - USER_PHONE_NUMBER=${USER_PHONE_NUMBER}
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - R2_BUCKET=${R2_BUCKET}
+      - R2_PUBLIC_BASE_URL=${R2_PUBLIC_BASE_URL}
     volumes:
       - backend_media:/app/media
     depends_on:
