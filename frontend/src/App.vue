@@ -694,6 +694,41 @@ const settingsForm = reactive({
 })
 const isSavingSettings = ref(false)
 
+// --- API connection test buttons (Settings tab) --------------------------
+const apiProviders = [
+  { key: 'gemini', label: 'Google Gemini' },
+  { key: 'openai', label: 'OpenAI' },
+  { key: 'elevenlabs', label: 'ElevenLabs' },
+  { key: 'youtube', label: 'YouTube' },
+  { key: 'tiktok', label: 'TikTok' },
+  { key: 'groq', label: 'Groq (LLM principal)' },
+  { key: 'claude', label: 'Claude (Anthropic)' },
+  { key: 'pexels', label: 'Pexels (mídia stock)' },
+  { key: 'pollinations', label: 'Pollinations (imagens de cena)' },
+  { key: 'shotstack', label: 'Shotstack (render em nuvem)' },
+  { key: 'r2', label: 'Cloudflare R2 (armazenamento)' },
+  { key: 'image_ranker', label: 'Image Ranker (seleção de mídia)' },
+]
+const apiTestResults = reactive({})
+apiProviders.forEach(p => { apiTestResults[p.key] = { loading: false, ok: null, message: '' } })
+
+const testProvider = async (key) => {
+  apiTestResults[key] = { loading: true, ok: null, message: '' }
+  try {
+    const res = await apiFetch(`/settings/test/${key}`)
+    const data = await res.json()
+    apiTestResults[key] = { loading: false, ok: !!data.ok, message: data.message || (res.ok ? 'OK' : 'Erro desconhecido') }
+  } catch (err) {
+    apiTestResults[key] = { loading: false, ok: false, message: 'Falha ao contatar o backend: ' + err.message }
+  }
+}
+
+const testAllProviders = async () => {
+  for (const p of apiProviders) {
+    await testProvider(p.key)
+  }
+}
+
 const fetchSettings = async () => {
   try {
     const res = await apiFetch('/settings')
@@ -1744,12 +1779,26 @@ const getStatusBadgeClass = (status) => {
 
             <div class="form-group">
               <label class="form-label">Google Gemini API Key <span v-if="settingsStatus.gemini_configured" style="color: var(--success);">(configurada)</span></label>
-              <input v-model="settingsForm.gemini_api_key" type="password" placeholder="AIzaSy..." class="form-input" />
+              <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <input v-model="settingsForm.gemini_api_key" type="password" placeholder="AIzaSy..." class="form-input" style="flex: 1;" />
+                <button type="button" class="btn btn-secondary" :disabled="apiTestResults.gemini.loading" @click="testProvider('gemini')" style="white-space: nowrap;">
+                  <span v-if="apiTestResults.gemini.loading" class="spinner"></span>
+                  <span v-else>Testar</span>
+                </button>
+              </div>
+              <p v-if="apiTestResults.gemini.message" style="font-size: 0.8rem; margin-top: 0.35rem;" :style="{ color: apiTestResults.gemini.ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults.gemini.message }}</p>
             </div>
 
             <div class="form-group">
               <label class="form-label">OpenAI API Key (para DALL-E e GPT) <span v-if="settingsStatus.openai_configured" style="color: var(--success);">(configurada)</span></label>
-              <input v-model="settingsForm.openai_api_key" type="password" placeholder="sk-..." class="form-input" />
+              <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <input v-model="settingsForm.openai_api_key" type="password" placeholder="sk-..." class="form-input" style="flex: 1;" />
+                <button type="button" class="btn btn-secondary" :disabled="apiTestResults.openai.loading" @click="testProvider('openai')" style="white-space: nowrap;">
+                  <span v-if="apiTestResults.openai.loading" class="spinner"></span>
+                  <span v-else>Testar</span>
+                </button>
+              </div>
+              <p v-if="apiTestResults.openai.message" style="font-size: 0.8rem; margin-top: 0.35rem;" :style="{ color: apiTestResults.openai.ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults.openai.message }}</p>
             </div>
           </div>
 
@@ -1757,7 +1806,14 @@ const getStatusBadgeClass = (status) => {
             <h3 style="font-weight: 700; margin-bottom: 1rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Narração (Vozes)</h3>
             <div class="form-group">
               <label class="form-label">ElevenLabs API Key (Vozes de Alta Fidelidade) <span v-if="settingsStatus.elevenlabs_configured" style="color: var(--success);">(configurada)</span></label>
-              <input v-model="settingsForm.elevenlabs_api_key" type="password" placeholder="Entrar ElevenLabs Key..." class="form-input" />
+              <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <input v-model="settingsForm.elevenlabs_api_key" type="password" placeholder="Entrar ElevenLabs Key..." class="form-input" style="flex: 1;" />
+                <button type="button" class="btn btn-secondary" :disabled="apiTestResults.elevenlabs.loading" @click="testProvider('elevenlabs')" style="white-space: nowrap;">
+                  <span v-if="apiTestResults.elevenlabs.loading" class="spinner"></span>
+                  <span v-else>Testar</span>
+                </button>
+              </div>
+              <p v-if="apiTestResults.elevenlabs.message" style="font-size: 0.8rem; margin-top: 0.35rem;" :style="{ color: apiTestResults.elevenlabs.ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults.elevenlabs.message }}</p>
             </div>
           </div>
 
@@ -1775,6 +1831,13 @@ const getStatusBadgeClass = (status) => {
                 <input v-model="settingsForm.youtube_client_secret" type="password" placeholder="secret" class="form-input" />
               </div>
             </div>
+            <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem;">
+              <button type="button" class="btn btn-secondary" :disabled="apiTestResults.youtube.loading" @click="testProvider('youtube')">
+                <span v-if="apiTestResults.youtube.loading" class="spinner"></span>
+                <span v-else>Testar YouTube</span>
+              </button>
+              <p v-if="apiTestResults.youtube.message" style="font-size: 0.8rem; margin: 0;" :style="{ color: apiTestResults.youtube.ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults.youtube.message }}</p>
+            </div>
 
             <div class="grid-cols-2">
               <div class="form-group">
@@ -1786,6 +1849,13 @@ const getStatusBadgeClass = (status) => {
                 <input v-model="settingsForm.tiktok_client_secret" type="password" placeholder="secret" class="form-input" />
               </div>
             </div>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <button type="button" class="btn btn-secondary" :disabled="apiTestResults.tiktok.loading" @click="testProvider('tiktok')">
+                <span v-if="apiTestResults.tiktok.loading" class="spinner"></span>
+                <span v-else>Testar TikTok</span>
+              </button>
+              <p v-if="apiTestResults.tiktok.message" style="font-size: 0.8rem; margin: 0;" :style="{ color: apiTestResults.tiktok.ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults.tiktok.message }}</p>
+            </div>
           </div>
 
           <div style="display: flex; justify-content: flex-end; gap: 1rem;">
@@ -1793,6 +1863,28 @@ const getStatusBadgeClass = (status) => {
               <span v-if="isSavingSettings" class="spinner"></span>
               <span v-else>Salvar Chaves</span>
             </button>
+          </div>
+        </div>
+
+        <div class="card" style="max-width: 700px; margin-top: 1.5rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+            <h3 style="font-weight: 700;">Diagnóstico de Conexões</h3>
+            <button type="button" class="btn btn-secondary" @click="testAllProviders">Testar Todas</button>
+          </div>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">
+            Demais integrações (configuradas via variável de ambiente no servidor, não editáveis aqui). Cada botão faz uma chamada real e mínima à API e mostra o motivo exato em caso de erro.
+          </p>
+          <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+            <div v-for="p in apiProviders.filter(p => ['groq','claude','pexels','pollinations','shotstack','r2','image_ranker'].includes(p.key))" :key="p.key"
+                 style="display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color);">
+              <span style="flex: 1; font-weight: 600;">{{ p.label }}</span>
+              <span v-if="apiTestResults[p.key].message" style="font-size: 0.8rem; max-width: 380px; text-align: right;"
+                    :style="{ color: apiTestResults[p.key].ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults[p.key].message }}</span>
+              <button type="button" class="btn btn-secondary" :disabled="apiTestResults[p.key].loading" @click="testProvider(p.key)" style="white-space: nowrap;">
+                <span v-if="apiTestResults[p.key].loading" class="spinner"></span>
+                <span v-else>Testar</span>
+              </button>
+            </div>
           </div>
         </div>
       </section>

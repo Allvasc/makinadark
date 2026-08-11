@@ -61,6 +61,7 @@ func SetupRoutes(app *fiber.App) {
 
 	protected.Get("/settings", GetSettings)
 	protected.Put("/settings", UpdateSettings)
+	protected.Get("/settings/test/:provider", TestAPIProvider)
 }
 
 // currentUserID reads the authenticated user id stashed by auth.RequireAuth.
@@ -1061,4 +1062,27 @@ func UpdateSettings(c *fiber.Ctx) error {
 		s.YouTubeClientID, s.YouTubeClientSec, s.TikTokClientID, s.TikTokClientSec)
 
 	return c.JSON(fiber.Map{"status": "saved"})
+}
+
+// testableProviders is the whitelist of :provider values TestAPIProvider
+// accepts - keeps the endpoint from being used to make the backend fire an
+// arbitrary outbound request to a caller-chosen host.
+var testableProviders = map[string]bool{
+	"groq": true, "openai": true, "gemini": true, "claude": true,
+	"elevenlabs": true, "pexels": true, "pollinations": true, "shotstack": true,
+	"r2": true, "image_ranker": true, "youtube": true, "tiktok": true,
+}
+
+// TestAPIProvider makes one real, minimal-cost call to the named external
+// API using whatever credentials are currently active (env or the operator
+// Settings override) and reports success/failure plus the provider's own
+// error message - so a bad/expired key surfaces its actual reason instead of
+// only being discovered later, mid-video-generation, buried in server logs.
+func TestAPIProvider(c *fiber.Ctx) error {
+	provider := c.Params("provider")
+	if !testableProviders[provider] {
+		return c.Status(400).JSON(fiber.Map{"error": "provedor desconhecido: " + provider})
+	}
+	ok, message := services.TestAPIConnection(provider)
+	return c.JSON(fiber.Map{"provider": provider, "ok": ok, "message": message})
 }
