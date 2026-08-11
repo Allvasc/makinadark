@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: makinadark-db
+    restart: always
+    environment:
+      POSTGRES_USER: makina
+      POSTGRES_PASSWORD: makinadark
+      POSTGRES_DB: makinadark
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  image-ranker:
+    build:
+      context: ./image-ranker
+      dockerfile: Dockerfile
+    container_name: makinadark-image-ranker
+    restart: always
+    # No published host port - only the backend talks to this, over the
+    # internal compose network (http://image-ranker:8500).
+    expose:
+      - "8500"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: makinadark-backend
+    restart: always
+    ports:
+      - "8081:8080"
+    # All secrets (OPENAI_API_KEY, GEMINI_API_KEY, ELEVENLABS_API_KEY, etc.) live
+    # only in backend/.env - do not duplicate them here as plain env vars.
+    env_file:
+      - ./backend/.env
+    environment:
+      - PORT=8080
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=makina
+      - POSTGRES_PASSWORD=makinadark
+      - POSTGRES_DB=makinadark
+      - IMAGE_RANKER_URL=http://image-ranker:8500
+    volumes:
+      - backend_media:/app/media
+    depends_on:
+      - postgres
+      - image-ranker
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: makinadark-frontend
+    restart: always
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  backend_media:

@@ -1,0 +1,21 @@
+# Secrets - never commit real API keys / OAuth credentials
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Backend runtime data
+backend/data/
+backend/media/
+# Catches stray media/ dirs created by ad-hoc `go run`/`go test` invocations
+# from other working directories inside backend/ (SaveMedia's local-disk
+# fallback writes relative to the process cwd).
+**/media/
+*.db
+
+# Go
+backend/makinadark-api
+
+# Frontend (frontend/ has its own .gitignore for node_modules/dist/etc.)
+
+# Stray local test output
+test_zoom.mp4
