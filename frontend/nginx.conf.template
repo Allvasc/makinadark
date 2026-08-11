@@ -6,8 +6,17 @@ server {
     # MEDIA_BASE) - the browser only ever talks to this one host:port, so it
     # works behind any domain/HTTPS reverse proxy (EasyPanel, etc.) with no
     # CORS or mixed-content configuration needed.
+    #
+    # BACKEND_HOST/BACKEND_PORT are substituted at container start (this file
+    # ships as /etc/nginx/templates/default.conf.template - the official
+    # nginx image runs envsubst on it automatically before boot, see
+    # Dockerfile). Defaults to "backend"/8080, matching this repo's own
+    # docker-compose.yml service name - override BACKEND_HOST when the
+    # backend isn't reachable under that exact name (e.g. EasyPanel, where a
+    # project named "ytd" makes every internal hostname "ytd_<service>", not
+    # the plain service name).
     location /api/ {
-        proxy_pass http://backend:8080/api/;
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/api/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -17,7 +26,7 @@ server {
     }
 
     location /media/ {
-        proxy_pass http://backend:8080/media/;
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/media/;
         proxy_set_header Host $host;
     }
 
