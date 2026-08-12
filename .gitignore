@@ -19,3 +19,6 @@ backend/makinadark-api
 
 # Stray local test output
 test_zoom.mp4
+
+# Claude Code local session state
+.claude/scheduled_tasks.lock

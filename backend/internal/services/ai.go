@@ -138,12 +138,23 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 	geminiKey := config.AppConfig.GeminiAPIKey
 	geminiConfigured := geminiKey != "" && geminiKey != "your_gemini_api_key_here"
 
+	// Every provider's own failure reason is collected (not just logged) so
+	// that if all of them fail, the caller - and ultimately the video's
+	// error_message shown in the UI - gets the real reason from each one
+	// (invalid key, quota exceeded, timeout, etc.) instead of a generic
+	// "all providers failed" that requires digging through server logs to
+	// explain. Previously, when OpenAI was configured as the last resort and
+	// also failed, only OpenAI's raw error was returned, silently discarding
+	// what Groq/Gemini/Claude had actually failed with.
+	var failures []string
+
 	if groqConfigured {
 		result, err := callGroq(channelID, videoID, prompt, groqKey)
 		if err == nil {
 			return result, nil
 		}
 		log.Printf("Groq call failed: %v", err)
+		failures = append(failures, "Groq: "+err.Error())
 	}
 
 	if geminiConfigured {
@@ -152,6 +163,7 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 			return result, nil
 		}
 		log.Printf("Gemini call failed: %v", err)
+		failures = append(failures, "Gemini: "+err.Error())
 	}
 
 	if claudeConfigured {
@@ -160,14 +172,25 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 			return result, nil
 		}
 		log.Printf("Claude call failed: %v", err)
+		failures = append(failures, "Claude: "+err.Error())
 	}
 
 	if openAIConfigured {
-		return callOpenAI(channelID, videoID, prompt, openAIKey)
+		result, err := callOpenAI(channelID, videoID, prompt, openAIKey)
+		if err == nil {
+			return result, nil
+		}
+		log.Printf("OpenAI call failed: %v", err)
+		failures = append(failures, "OpenAI: "+err.Error())
 	}
 
-	log.Println("ERROR: No active LLM API keys configured or all providers failed.")
-	return "", fmt.Errorf("no active LLM API keys configured or all providers failed")
+	if len(failures) == 0 {
+		log.Println("ERROR: No active LLM API keys configured.")
+		return "", fmt.Errorf("nenhuma chave de API de LLM configurada (Groq/Gemini/Claude/OpenAI)")
+	}
+
+	log.Printf("ERROR: All LLM providers failed: %s", strings.Join(failures, " | "))
+	return "", fmt.Errorf("todos os provedores de LLM falharam - %s", strings.Join(failures, " | "))
 }
 
 func callGroq(channelID, videoID, prompt string, apiKey string) (string, error) {

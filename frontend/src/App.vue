@@ -411,13 +411,15 @@ const generateLogo = async () => {
     const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-logo`, {
       method: 'POST'
     })
+    const data = await res.json()
     if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
+      activeChannel.value = data
       await fetchChannels()
+    } else {
+      alert('Erro ao gerar logotipo: ' + (data.error || `HTTP ${res.status}`))
     }
   } catch (err) {
-    alert('Erro ao gerar logotipo.')
+    alert('Erro ao gerar logotipo: ' + err.message)
   } finally {
     isGeneratingLogo.value = false
   }
@@ -430,13 +432,15 @@ const generateBanner = async () => {
     const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-banner`, {
       method: 'POST'
     })
+    const data = await res.json()
     if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
+      activeChannel.value = data
       await fetchChannels()
+    } else {
+      alert('Erro ao gerar a capa do canal: ' + (data.error || `HTTP ${res.status}`))
     }
   } catch (err) {
-    alert('Erro ao gerar a capa do canal.')
+    alert('Erro ao gerar a capa do canal: ' + err.message)
   } finally {
     isGeneratingBanner.value = false
   }
