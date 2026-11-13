@@ -11,24 +11,46 @@ import (
 // Pricing rates below are the operator-facing estimates used to compute
 // EstimatedCostUSD on ApiUsageLog rows. Units (tokens/characters/images) are
 // always the exact values reported by the provider - only the $ conversion is
-// an estimate, since providers can and do change pricing. Verified 2026-08-09:
-//   - OpenAI gpt-4o-mini: https://openai.com/api/pricing (search results)
-//   - OpenAI gpt-image-1.5: per-image pricing pages (langcopilot/pricepertoken)
-//   - OpenAI tts-1: https://www.burnwise.io/ai-pricing/model/tts-1 ($0.015/1k chars)
+// an estimate, since providers can and do change pricing.
+//   - OpenAI gpt-4o-mini: https://openai.com/api/pricing
+//   - OpenAI gpt-image-1.5: per-image estimates by quality/size (see
+//     openAIImageCost) - verify against the OpenAI pricing page.
+//   - OpenAI tts-1: $0.015/1k chars
+//   - Anthropic claude-sonnet-5-5: $2 / $10 per 1M input/output tokens
 //   - ElevenLabs: https://elevenlabs.io/pricing (Creator tier, regular price)
-//   - Gemini (gemini-flash-latest): free tier, 1500 requests/day - $0. A paid/
-//     prepay-linked project loses free-tier access permanently for that
-//     project (see ai.go callGemini) - use a fresh AI-Studio-only key.
+//   - Gemini text (gemini-flash-latest): free tier, $0 - the per-key daily
+//     request quota is GEMINI_FREE_TIER_DAILY_LIMIT (config.go).
 const (
 	openAIInputTokenCostPer1M  = 0.15     // gpt-4o-mini
 	openAIOutputTokenCostPer1M = 0.60     // gpt-4o-mini
-	claudeInputTokenCostPer1M  = 3.00     // claude-3-5-sonnet-20241022
-	claudeOutputTokenCostPer1M = 15.00    // claude-3-5-sonnet-20241022
-	openAIImageCostGptImage15  = 0.034    // gpt-image-1.5, 1024x1024, medium quality
+	claudeInputTokenCostPer1M  = 2.00     // claude-sonnet-5-5
+	claudeOutputTokenCostPer1M = 10.00    // claude-sonnet-5-5
 	geminiImageCostFlashLite1K = 0.0336   // gemini-3.1-flash-lite-image, 1K output
 	openAITTSCostPerChar       = 0.000015 // tts-1, $0.015/1,000 chars
 	elevenLabsCostPerChar      = 0.000182 // ElevenLabs Creator tier, $22/121,000 chars
 )
+
+// openAIImageCost estimates one gpt-image-1.5 render by quality and size.
+func openAIImageCost(quality, size string) float64 {
+	square := size == "1024x1024"
+	switch quality {
+	case "low":
+		if square {
+			return 0.009
+		}
+		return 0.013
+	case "medium":
+		if square {
+			return 0.034
+		}
+		return 0.05
+	default: // high
+		if square {
+			return 0.133
+		}
+		return 0.20
+	}
+}
 
 // RecordUsage logs one external API call for the cost dashboard. channelID is
 // required; videoID may be empty for channel-level calls (branding, intro/outro
@@ -71,14 +93,14 @@ func RecordGroqTokens(channelID, videoID string, promptTokens, completionTokens 
 }
 
 // RecordGeminiRequest logs a Gemini call. Currently always $0 (free tier) -
-// what matters here is the request count, since the free tier caps at 1500/day.
+// what matters here is the request count against the daily free-tier quota.
 func RecordGeminiRequest(channelID, videoID string) {
 	RecordUsage(channelID, videoID, "gemini", "llm_completion", 1, "requests", 0)
 }
 
-// RecordImageGeneration logs one gpt-image-1.5 call.
-func RecordImageGeneration(channelID, videoID string) {
-	RecordUsage(channelID, videoID, "openai", "image_generation", 1, "images", openAIImageCostGptImage15)
+// RecordImageGeneration logs one OpenAI gpt-image call at its estimated cost.
+func RecordImageGeneration(channelID, videoID string, costUSD float64) {
+	RecordUsage(channelID, videoID, "openai", "image_generation", 1, "images", costUSD)
 }
 
 // RecordGeminiImageGeneration logs one gemini-3.1-flash-lite-image call

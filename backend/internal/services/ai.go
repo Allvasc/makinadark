@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -104,6 +105,9 @@ type ClaudeRequest struct {
 	Model     string          `json:"model"`
 	MaxTokens int             `json:"max_tokens"`
 	Messages  []ClaudeMessage `json:"messages"`
+	// Fallbacks "default" (beta server-side-fallback-2026-07-01) lets the API
+	// retry a safety-classifier refusal on a suitable fallback model itself.
+	Fallbacks string `json:"fallbacks,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -116,7 +120,8 @@ type ClaudeResponse struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
-	Usage struct {
+	StopReason string `json:"stop_reason"`
+	Usage      struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
@@ -127,16 +132,16 @@ type ClaudeResponse struct {
 // may be empty for channel-level calls (branding, trends) not tied to one video.
 func CallLLM(channelID, videoID, prompt string) (string, error) {
 	groqKey := config.AppConfig.GroqAPIKey
-	groqConfigured := groqKey != "" && groqKey != "your_groq_api_key_here"
+	groqConfigured := config.IsSet(groqKey)
 
 	claudeKey := config.AppConfig.AnthropicAPIKey
-	claudeConfigured := claudeKey != "" && claudeKey != "your_anthropic_api_key_here"
+	claudeConfigured := config.IsSet(claudeKey)
 
 	openAIKey := config.AppConfig.OpenAIAPIKey
-	openAIConfigured := openAIKey != "" && openAIKey != "your_openai_api_key_here"
+	openAIConfigured := config.IsSet(openAIKey)
 
 	geminiKey := config.AppConfig.GeminiAPIKey
-	geminiConfigured := geminiKey != "" && geminiKey != "your_gemini_api_key_here"
+	geminiConfigured := config.IsSet(geminiKey)
 
 	// Every provider's own failure reason is collected (not just logged) so
 	// that if all of them fail, the caller - and ultimately the video's
@@ -250,13 +255,17 @@ func callClaude(channelID, videoID, prompt string, apiKey string) (string, error
 	url := "https://api.anthropic.com/v1/messages"
 
 	reqPayload := ClaudeRequest{
-		Model: "claude-3-5-sonnet-20241022",
-		// 8192 (up from 4096) so a full 35-55 scene / 3000-4500 word video
-		// script fits without Claude truncating the JSON mid-object.
-		MaxTokens: 8192,
+		// claude-3-5-sonnet-20241022 was retired on 2025-10-28 - every call
+		// to it 404'd, so this provider had been silently dead in the chain.
+		Model: claudeModel,
+		// Current models think adaptively before answering and that thinking
+		// counts against max_tokens, so a full 35-55 scene script needs real
+		// headroom to avoid the JSON being cut off mid-object.
+		MaxTokens: 16000,
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: prompt + "\n\nIMPORTANTE: Retorne ESTRITAMENTE um objeto JSON válido."},
 		},
+		Fallbacks: "default",
 	}
 
 	body, err := json.Marshal(reqPayload)
@@ -271,8 +280,9 @@ func callClaude(channelID, videoID, prompt string, apiKey string) (string, error
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("anthropic-beta", "server-side-fallback-2026-07-01")
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -293,14 +303,33 @@ func callClaude(channelID, videoID, prompt string, apiKey string) (string, error
 		return "", err
 	}
 
-	if len(claudeResp.Content) == 0 {
-		return "", fmt.Errorf("anthropic claude api returned empty content")
-	}
-
 	RecordClaudeTokens(channelID, videoID, claudeResp.Usage.InputTokens, claudeResp.Usage.OutputTokens)
 
-	return claudeResp.Content[0].Text, nil
+	switch claudeResp.StopReason {
+	case "refusal":
+		return "", fmt.Errorf("claude recusou a solicitação (stop_reason=refusal)")
+	case "max_tokens":
+		return "", fmt.Errorf("resposta do claude truncada (max_tokens) - JSON incompleto")
+	}
+
+	// Content[0] is a thinking block on current models, not the answer -
+	// only text blocks carry the response.
+	var sb strings.Builder
+	for _, block := range claudeResp.Content {
+		if block.Type == "text" {
+			sb.WriteString(block.Text)
+		}
+	}
+	text := strings.TrimSpace(sb.String())
+	if text == "" {
+		return "", fmt.Errorf("anthropic claude api returned no text content")
+	}
+	return text, nil
 }
+
+// claudeModel is the current Sonnet, the direct successor of the retired
+// claude-3-5-sonnet this code was written against.
+const claudeModel = "claude-sonnet-5-5"
 
 func callGemini(channelID, videoID, prompt string, apiKey string) (string, error) {
 	// "gemini-2.5-flash" was retired for new accounts (404 "no longer
@@ -775,33 +804,112 @@ func jaccardSimilarity(a, b map[string]bool) float64 {
 	return float64(intersection) / float64(union)
 }
 
-// GenerateImage generates branding-critical images (logo, banner/cover, video
-// thumbnails) via the Gemini image API ONLY - no Pollinations/placeholder
-// fallback for these, since low-quality Pollinations output for exactly
-// these three categories is what prompted the switch to Gemini in the first
-// place. If Gemini isn't configured or fails (e.g. depleted AI Studio
-// credits), the caller gets the error back instead of a worse image.
-// Per-scene illustration images stay on Pollinations - they're generated in
-// bulk (multiple per video) and don't need the same visual bar. OpenAI is
-// completely disabled for image generation to eliminate credit/quota errors.
+// isBrandingCategory marks the images that define how a channel looks -
+// generated rarely, seen constantly - as opposed to bulk per-scene images.
+func isBrandingCategory(category string) bool {
+	return category == "logo" || category == "banner" || category == "thumbnail"
+}
+
+// GenerateImage routes image generation by category:
+//
+//   - logo / banner / thumbnail (branding-critical, a handful per channel):
+//     OpenAI gpt-image first (best quality, follows layout/text instructions),
+//     then Gemini. Pollinations is used ONLY when neither key is configured -
+//     if a configured provider fails (quota, billing, invalid key) the caller
+//     gets that real error back instead of a silently worse image.
+//   - scene_* (bulk: dozens per video, and only reached after Pexels had no
+//     usable photo): Pollinations first (free), Gemini as fallback. OpenAI is
+//     deliberately NOT used here - at ~$0.03-0.20/image it would turn every
+//     video into several dollars of image spend.
 func GenerateImage(channelID, videoID, prompt string, category string) (string, error) {
-	// Try Gemini image model first if API key is configured
-	geminiKey := config.AppConfig.GeminiAPIKey
-	if geminiKey != "" && geminiKey != "your_gemini_api_key_here" {
-		if path, err := generateGeminiImage(channelID, videoID, prompt, category, geminiKey); err == nil && path != "" {
-			return path, nil
-		}
-	}
-
-	// Try OpenAI DALL-E if key is available
 	openAIKey := config.AppConfig.OpenAIAPIKey
-	if openAIKey != "" && openAIKey != "your_openai_api_key_here" {
-		if path, err := generateDallEImage(channelID, videoID, prompt, openAIKey); err == nil && path != "" {
-			return path, nil
+	geminiKey := config.AppConfig.GeminiAPIKey
+	var failures []string
+
+	if isBrandingCategory(category) {
+		if config.IsSet(openAIKey) {
+			path, err := generateOpenAIImage(channelID, videoID, prompt, category, openAIKey)
+			if err == nil && path != "" {
+				return path, nil
+			}
+			log.Printf("OpenAI image generation failed (%s): %v", category, err)
+			failures = append(failures, "OpenAI: "+errString(err))
 		}
+		if config.IsSet(geminiKey) {
+			path, err := generateGeminiImage(channelID, videoID, prompt, category, geminiKey)
+			if err == nil && path != "" {
+				return path, nil
+			}
+			log.Printf("Gemini image generation failed (%s): %v", category, err)
+			failures = append(failures, "Gemini: "+errString(err))
+		}
+		if len(failures) > 0 {
+			return "", fmt.Errorf("falha ao gerar imagem (%s) - %s", category, strings.Join(failures, " | "))
+		}
+		log.Printf("WARNING: no OpenAI/Gemini key configured - generating %s with Pollinations (lower quality)", category)
+		return generatePollinationsImage(prompt, category)
 	}
 
-	return generatePollinationsImage(prompt, category)
+	path, err := generatePollinationsImage(prompt, category)
+	if err == nil && path != "" {
+		return path, nil
+	}
+	failures = append(failures, "Pollinations: "+errString(err))
+	if config.IsSet(geminiKey) {
+		path, gErr := generateGeminiImage(channelID, videoID, prompt, category, geminiKey)
+		if gErr == nil && path != "" {
+			return path, nil
+		}
+		failures = append(failures, "Gemini: "+errString(gErr))
+	}
+	return "", fmt.Errorf("falha ao gerar imagem de cena - %s", strings.Join(failures, " | "))
+}
+
+func errString(err error) string {
+	if err == nil {
+		return "resposta vazia"
+	}
+	return err.Error()
+}
+
+// BuildLogoPrompt turns the branding LLM's short visual idea into a full
+// art-direction brief. The old prompt ("A sleek minimalist vector logo
+// depicting <niche>, 4k") gave image models nothing to work with, which is
+// why logos came out generic: no constraints on legibility at avatar size,
+// circular cropping, palette or style.
+func BuildLogoPrompt(channelName, niche, concept, visualIdea string) string {
+	if strings.TrimSpace(visualIdea) == "" {
+		visualIdea = "a symbol that captures the essence of " + niche
+	}
+	return fmt.Sprintf(`Design a premium YouTube channel avatar logo for the channel "%s" (niche: %s).
+Channel concept: %s
+Visual idea for the emblem: %s
+
+Art direction:
+- One bold, iconic emblem/symbol centered on a square canvas, with generous padding so it survives a circular crop.
+- Clean modern vector / flat-illustration style, crisp edges, strong readable silhouette, at most three harmonious colors plus the background.
+- Must stay instantly recognizable at 48x48 pixels - no thin lines or tiny details.
+- Solid or very subtle gradient background in a color that contrasts with the emblem; palette and mood must fit the niche.
+- Agency-level brand identity quality.
+Strictly no text, letters, numbers, signatures, watermarks, mockup frames or real-world brand logos.`,
+		channelName, niche, strings.TrimSpace(concept), strings.TrimSpace(visualIdea))
+}
+
+// BuildBannerPrompt is the channel-cover counterpart of BuildLogoPrompt.
+func BuildBannerPrompt(channelName, niche, concept, visualIdea string) string {
+	if strings.TrimSpace(visualIdea) == "" {
+		visualIdea = "a cinematic scene that represents " + niche
+	}
+	return fmt.Sprintf(`Design the YouTube channel banner (cover art) for the channel "%s" (niche: %s).
+Channel concept: %s
+Scene / visual idea: %s
+
+Art direction:
+- Wide, cinematic landscape composition, polished key-art quality with rich lighting, depth and a cohesive color palette that fits the niche.
+- YouTube crops the top, bottom and sides on phones and TVs: keep the title and the main subject inside the horizontal center band; the edges should be atmospheric background only.
+- Render the channel name "%s" exactly once as a large, bold, perfectly spelled title (keep every accent), in a typeface that matches the niche, with strong contrast against the background.
+- No other text, no taglines, no watermarks, no UI or device mockups, no real-world brand logos.`,
+		channelName, niche, strings.TrimSpace(concept), strings.TrimSpace(visualIdea), channelName)
 }
 
 // generateGeminiImage generates an image with Gemini 3.1 Flash Lite Image
@@ -897,7 +1005,7 @@ func generatePollinationsImage(prompt, category string) (string, error) {
 		return "", fmt.Errorf("failed to create image request: %w", err)
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
@@ -916,20 +1024,43 @@ func generatePollinationsImage(prompt, category string) (string, error) {
 	return SaveMediaFromReader(resp.Body, "images/"+fileName, "image/jpeg")
 }
 
-func generateDallEImage(channelID, videoID, prompt string, apiKey string) (string, error) {
+// openAIImageParams picks size/quality/format per category. Logos and
+// banners are generated once per channel, so they get "high" quality;
+// thumbnails are per video, so "medium" keeps that cost reasonable.
+// OPENAI_IMAGE_QUALITY (low|medium|high) overrides both.
+func openAIImageParams(category string) (size, quality, format string) {
+	size, quality, format = "1536x1024", "high", "jpeg"
+	switch category {
+	case "logo":
+		size, format = "1024x1024", "png"
+	case "thumbnail":
+		quality = "medium"
+	}
+	if q := strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_IMAGE_QUALITY"))); q == "low" || q == "medium" || q == "high" {
+		quality = q
+	}
+	return size, quality, format
+}
+
+// generateOpenAIImage calls the OpenAI Images API (gpt-image family). The
+// gpt-image models don't accept "response_format" - they always return
+// b64_json, which is decoded below. OPENAI_IMAGE_MODEL overrides the model.
+func generateOpenAIImage(channelID, videoID, prompt, category, apiKey string) (string, error) {
 	url := "https://api.openai.com/v1/images/generations"
 
-	// Uses gpt-image-1.5 instead of dall-e-3: several projects/orgs no longer
-	// have dall-e-3 enabled ("model does not exist"), and the gpt-image family
-	// doesn't accept "response_format" - it always returns b64_json, which is
-	// what we decode below. gpt-image-1 (the older sibling) is being retired
-	// 2026-10-23, and 1.5 is also cheaper ($0.034 vs $0.042 per 1024x1024
-	// medium-quality image), so we go straight to the newer model.
+	model := strings.TrimSpace(os.Getenv("OPENAI_IMAGE_MODEL"))
+	if model == "" {
+		model = "gpt-image-1.5"
+	}
+	size, quality, format := openAIImageParams(category)
+
 	reqPayload := map[string]interface{}{
-		"model":  "gpt-image-1.5",
-		"prompt": prompt,
-		"n":      1,
-		"size":   "1024x1024",
+		"model":         model,
+		"prompt":        prompt,
+		"n":             1,
+		"size":          size,
+		"quality":       quality,
+		"output_format": format,
 	}
 
 	body, err := json.Marshal(reqPayload)
@@ -944,7 +1075,9 @@ func generateDallEImage(channelID, videoID, prompt string, apiKey string) (strin
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	// High-quality gpt-image renders routinely take 30-90s; the old 60s
+	// timeout cut off exactly the requests worth waiting for.
+	client := &http.Client{Timeout: 4 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -957,36 +1090,42 @@ func generateDallEImage(channelID, videoID, prompt string, apiKey string) (strin
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("dall-e api returned status %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("openai images api (%s) returned status %d: %s", model, resp.StatusCode, string(respBody))
 	}
 
-	var dallEResp struct {
+	var imgResp struct {
 		Data []struct {
 			URL     string `json:"url"`
 			B64JSON string `json:"b64_json"`
 		} `json:"data"`
 	}
 
-	if err := json.Unmarshal(respBody, &dallEResp); err != nil {
+	if err := json.Unmarshal(respBody, &imgResp); err != nil {
 		return "", err
 	}
 
-	if len(dallEResp.Data) == 0 {
-		return "", fmt.Errorf("dall-e returned no images")
+	if len(imgResp.Data) == 0 {
+		return "", fmt.Errorf("openai images api returned no images")
 	}
 
-	RecordImageGeneration(channelID, videoID)
+	RecordImageGeneration(channelID, videoID, openAIImageCost(quality, size))
 
-	if dallEResp.Data[0].B64JSON != "" {
-		imgBytes, err := base64.StdEncoding.DecodeString(dallEResp.Data[0].B64JSON)
+	if imgResp.Data[0].B64JSON != "" {
+		imgBytes, err := base64.StdEncoding.DecodeString(imgResp.Data[0].B64JSON)
 		if err != nil {
-			return "", fmt.Errorf("failed to decode dall-e base64 image: %v", err)
+			return "", fmt.Errorf("failed to decode openai base64 image: %v", err)
 		}
-		fileName := fmt.Sprintf("img_%d.jpg", time.Now().UnixNano())
-		return SaveMedia(imgBytes, "images/"+fileName, "image/jpeg")
+		// Extension and Content-Type now match the bytes actually returned
+		// (logos used to be PNG data saved as ".jpg" / image/jpeg).
+		ext, contentType := ".jpg", "image/jpeg"
+		if format == "png" {
+			ext, contentType = ".png", "image/png"
+		}
+		fileName := fmt.Sprintf("%s_openai_%d%s", category, time.Now().UnixNano(), ext)
+		return SaveMedia(imgBytes, "images/"+fileName, contentType)
 	}
 
-	return downloadImage(dallEResp.Data[0].URL)
+	return downloadImage(imgResp.Data[0].URL)
 }
 
 func downloadImage(url string) (string, error) {
@@ -1011,7 +1150,7 @@ func GenerateVoiceOver(channelID, videoID, text string, sceneIndex int) (string,
 	}
 
 	apiKey := config.AppConfig.ElevenLabsAPIKey
-	if apiKey != "" && apiKey != "your_elevenlabs_api_key_here" {
+	if config.IsSet(apiKey) {
 		audio, err := generateElevenLabsTTS(channelID, videoID, text, sceneIndex)
 		if err == nil && audio != "" {
 			return audio, nil
@@ -1020,7 +1159,7 @@ func GenerateVoiceOver(channelID, videoID, text string, sceneIndex int) (string,
 	}
 
 	openAIKey := config.AppConfig.OpenAIAPIKey
-	if openAIKey != "" && openAIKey != "your_openai_api_key_here" {
+	if config.IsSet(openAIKey) {
 		audio, err := generateOpenAITTS(channelID, videoID, text, sceneIndex, openAIKey)
 		if err == nil && audio != "" {
 			return audio, nil

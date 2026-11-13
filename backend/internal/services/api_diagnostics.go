@@ -59,7 +59,7 @@ func TestAPIConnection(provider string) (bool, string) {
 // ".env.example" placeholder scaffold ("your_x_here") both count as "not
 // configured".
 func isKeyConfigured(value string) bool {
-	return value != "" && !strings.HasPrefix(value, "your_")
+	return config.IsSet(value)
 }
 
 // doTestRequest runs the request and turns any non-2xx response into a

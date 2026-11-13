@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"makinadark/backend/internal/config"
 	"net/http"
-	"os"
 	"time"
 
 	"makinadark/backend/internal/models"
@@ -64,8 +64,7 @@ type ShotstackStatusResponse struct {
 
 // RenderVideoInCloud triggers cloud rendering via Shotstack API (0% Local CPU)
 func RenderVideoInCloud(video *models.Video, isShorts bool) (string, error) {
-	apiKey := os.Getenv("SHOTSTACK_API_KEY")
-	if apiKey != "" && apiKey != "your_shotstack_api_key_here" {
+	if apiKey := config.AppConfig.ShotstackAPIKey; config.IsSet(apiKey) {
 		return submitShotstackRender(video, isShorts, apiKey)
 	}
 

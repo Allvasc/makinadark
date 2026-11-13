@@ -136,11 +136,19 @@ body {
   border: 1px solid var(--border-color);
   border-radius: 20px;
   padding: 1.75rem;
-  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: border-color 0.3s ease, box-shadow 0.3s ease, transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  min-width: 0;
 }
 
 .card:hover {
   border-color: var(--border-hover);
+}
+
+.card-clickable {
+  cursor: pointer;
+}
+
+.card-clickable:hover {
   transform: translateY(-4px);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
 }
@@ -205,6 +213,12 @@ h1 {
 .btn-cyan:hover {
   transform: translateY(-2px);
   box-shadow: 0 6px 20px rgba(6, 182, 212, 0.5);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
 }
 
 /* Inputs & Forms */
@@ -420,7 +434,128 @@ h1 {
   border: 1px solid rgba(239, 68, 68, 0.3);
 }
 
+.badge-posting {
+  background: rgba(16, 185, 129, 0.12);
+  color: var(--success);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  animation: pulse 2s infinite;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
+}
+
+/* Responsive Layout Helpers */
+.flex-wrap-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.channel-overview-layout {
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 1.5rem;
+  align-items: start;
+  margin-bottom: 3rem;
+}
+
+.channel-persona-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.channel-visual-grid {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: stretch;
+}
+
+.channel-bar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.scorecard-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.video-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+@media (max-width: 1200px) {
+  .channel-overview-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .grid-cols-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1024px) {
+  .video-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .scorecard-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .grid-cols-2,
+  .grid-cols-4 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .app-container {
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--border-color);
+    padding: 1.25rem;
+    gap: 1rem;
+  }
+  .nav-menu {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .main-content {
+    padding: 1.25rem;
+  }
+  .channel-visual-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .grid-cols-3,
+  .channel-persona-grid,
+  .scorecard-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .calendar-grid {
+    gap: 0.25rem;
+  }
+  .calendar-day {
+    min-height: 75px;
+    padding: 0.35rem;
+  }
 }

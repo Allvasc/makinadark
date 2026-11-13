@@ -7,21 +7,16 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"time"
 
 	"makinadark/backend/internal/config"
 )
 
 func getPexelsAPIKey() string {
-	apiKey := os.Getenv("PEXELS_API_KEY")
-	if apiKey == "" || apiKey == "your_pexels_api_key_here" {
-		apiKey = config.AppConfig.PexelsAPIKey
-	}
-	if apiKey == "your_pexels_api_key_here" {
+	if !config.IsSet(config.AppConfig.PexelsAPIKey) {
 		return ""
 	}
-	return apiKey
+	return config.AppConfig.PexelsAPIKey
 }
 
 type PexelsPhotoResponse struct {
@@ -108,8 +103,8 @@ func FetchStockPhoto(channelID, videoID, query string) (string, error) {
 
 // AcquireSceneImage prefers a real, free Pexels photo (cheaper, and more
 // "factual" for a real location/subject than an AI illustration) and falls
-// back to AI generation (gpt-image-1.5) only when Pexels isn't configured or
-// returned nothing usable for the query.
+// back to AI generation (GenerateImage's scene route: Pollinations, then
+// Gemini) only when Pexels isn't configured or returned nothing usable.
 func AcquireSceneImage(channelID, videoID, prompt, category string) (string, error) {
 	if photoPath, err := FetchStockPhoto(channelID, videoID, prompt); err == nil && photoPath != "" {
 		return photoPath, nil

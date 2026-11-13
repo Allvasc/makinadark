@@ -1,6 +1,12 @@
 package auth
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +51,7 @@ func GenerateToken(userID string) (string, error) {
 func parseToken(tokenStr string) (string, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &claims{}, func(t *jwt.Token) (interface{}, error) {
 		return []byte(config.AppConfig.JWTSecret), nil
-	})
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
 	if err != nil || !token.Valid {
 		return "", fiber.ErrUnauthorized
 	}
@@ -72,4 +78,72 @@ func RequireAuth(c *fiber.Ctx) error {
 
 	c.Locals("user_id", userID)
 	return c.Next()
+}
+
+// ---------------------------------------------------------------------------
+// OAuth "state" signing
+// ---------------------------------------------------------------------------
+//
+// The OAuth callback is hit by Google/TikTok redirecting the browser, so it
+// can't carry our Bearer token. It used to trust a plain "youtube:<channelID>"
+// state, which let anyone who knew (or guessed) a channel ID bind their own
+// YouTube/TikTok account to someone else's channel. The state is now an
+// HMAC-signed, expiring token naming the provider, channel AND the user who
+// started the flow; the callback rejects anything it didn't issue itself.
+
+const oauthStateTTL = 15 * time.Minute
+
+// OAuthState is the verified payload carried through an OAuth round trip.
+type OAuthState struct {
+	Provider  string
+	ChannelID string
+	UserID    string
+}
+
+func stateMAC(data string) []byte {
+	mac := hmac.New(sha256.New, []byte("oauth-state:"+config.AppConfig.JWTSecret))
+	mac.Write([]byte(data))
+	return mac.Sum(nil)
+}
+
+// SignOAuthState builds the opaque state value for an authorization URL.
+func SignOAuthState(s OAuthState) string {
+	payload := strings.Join([]string{s.Provider, s.ChannelID, s.UserID, strconv.FormatInt(time.Now().Add(oauthStateTTL).Unix(), 10)}, "|")
+	enc := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	return enc + "." + base64.RawURLEncoding.EncodeToString(stateMAC(enc))
+}
+
+// VerifyOAuthState checks signature and expiry and returns the payload.
+func VerifyOAuthState(state string) (OAuthState, error) {
+	enc, sig, found := strings.Cut(state, ".")
+	if !found {
+		return OAuthState{}, errors.New("state malformado")
+	}
+	gotMAC, err := base64.RawURLEncoding.DecodeString(sig)
+	if err != nil || !hmac.Equal(gotMAC, stateMAC(enc)) {
+		return OAuthState{}, errors.New("assinatura do state inválida")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(enc)
+	if err != nil {
+		return OAuthState{}, errors.New("state malformado")
+	}
+	parts := strings.Split(string(raw), "|")
+	if len(parts) != 4 {
+		return OAuthState{}, errors.New("state malformado")
+	}
+	exp, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return OAuthState{}, errors.New("link de autorização expirado - inicie a conexão novamente")
+	}
+	return OAuthState{Provider: parts[0], ChannelID: parts[1], UserID: parts[2]}, nil
+}
+
+// PKCEVerifier derives a per-flow PKCE code_verifier from the signed state,
+// so it never has to be stored server-side between the redirect and the
+// callback (TikTok previously used one hardcoded verifier for every user,
+// which defeats the point of PKCE). 64 hex chars fits RFC 7636's 43-128.
+func PKCEVerifier(state string) string {
+	mac := hmac.New(sha256.New, []byte("pkce:"+config.AppConfig.JWTSecret))
+	mac.Write([]byte(state))
+	return hex.EncodeToString(mac.Sum(nil))
 }

@@ -17,10 +17,11 @@ import (
 	"makinadark/backend/internal/models"
 )
 
-// GetYouTubeAuthURL generates Google OAuth2 login URL
-func GetYouTubeAuthURL(channelID string) string {
+// GetYouTubeAuthURL generates the Google OAuth2 consent URL. state must be
+// the signed value from auth.SignOAuthState - the callback verifies it.
+func GetYouTubeAuthURL(state string) string {
 	baseURL := "https://accounts.google.com/o/oauth2/v2/auth"
-	
+
 	params := url.Values{}
 	params.Add("client_id", config.AppConfig.YouTubeClientID)
 	params.Add("redirect_uri", config.AppConfig.RedirectURI)
@@ -29,7 +30,7 @@ func GetYouTubeAuthURL(channelID string) string {
 	params.Add("scope", "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly")
 	params.Add("access_type", "offline")
 	params.Add("prompt", "consent")
-	params.Add("state", fmt.Sprintf("youtube:%s", channelID)) // carry channel id
+	params.Add("state", state)
 
 	return baseURL + "?" + params.Encode()
 }
@@ -107,10 +108,12 @@ func RefreshYouTubeToken(refreshToken string) (*TokenResponse, error) {
 	return &tokenResp, nil
 }
 
-// UploadToYouTube uploads a video to YouTube Data API v3
-func UploadToYouTube(channel *models.Channel, video *models.Video, isShorts bool) (string, error) {
+// UploadToYouTube uploads a local video file to the YouTube Data API v3.
+// localPath must be a file on disk (see localCopy) - the stored VideoPath
+// may be an R2 URL.
+func UploadToYouTube(channel *models.Channel, video *models.Video, localPath string) (string, error) {
 	// 1. Check/Refresh token
-	if time.Now().After(channel.YTTokenExpiry) {
+	if channel.YTAccessToken == "" || time.Now().After(channel.YTTokenExpiry.Add(-2*time.Minute)) {
 		log.Printf("YouTube access token expired for channel %s, refreshing...", channel.Name)
 		tokenResp, err := RefreshYouTubeToken(channel.YTRefreshToken)
 		if err != nil {
@@ -121,35 +124,32 @@ func UploadToYouTube(channel *models.Channel, video *models.Video, isShorts bool
 			channel.YTRefreshToken = tokenResp.RefreshToken
 		}
 		channel.YTTokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		db.DB.Save(channel)
+		// Only the token columns - a full Save of this (possibly stale) copy
+		// would overwrite anything edited on the channel meanwhile.
+		db.DB.Model(&models.Channel{}).Where("id = ?", channel.ID).Updates(map[string]interface{}{
+			"yt_access_token":  channel.YTAccessToken,
+			"yt_refresh_token": channel.YTRefreshToken,
+			"yt_token_expiry":  channel.YTTokenExpiry,
+		})
 	}
 
-	// Determine video path
-	videoPath := video.VideoPath
-	if isShorts && video.ShortsPath != "" {
-		videoPath = video.ShortsPath
-	}
-
-	if _, err := os.Stat(videoPath); os.IsNotExist(err) {
+	videoPath := localPath
+	if _, err := os.Stat(videoPath); err != nil {
 		return "", fmt.Errorf("video file does not exist: %s", videoPath)
 	}
 
 	// YouTube Resumable Upload
 	// Step 1: Initialize Upload Request
 	initURL := "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status"
-	
+
 	// Create Metadata body
 	privacyStatus := "public"
-	if isShorts {
-		// Shorts are public, and YouTube description/tags will categorize it
-		privacyStatus = "public"
-	}
 
 	metadata := map[string]interface{}{
 		"snippet": map[string]interface{}{
-			"title":       video.Title,
-			"description": video.Description,
-			"tags":        strings.Split(video.Tags, ","),
+			"title":       youtubeTitle(video.Title),
+			"description": youtubeDescription(video.Description),
+			"tags":        youtubeTags(video.Tags),
 		},
 		"status": map[string]interface{}{
 			"privacyStatus": privacyStatus,
@@ -168,7 +168,7 @@ func UploadToYouTube(channel *models.Channel, video *models.Video, isShorts bool
 	req.Header.Set("Authorization", "Bearer "+channel.YTAccessToken)
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	req.Header.Set("X-Upload-Content-Type", "video/mp4")
-	
+
 	fileInfo, err := os.Stat(videoPath)
 	if err != nil {
 		return "", err
@@ -206,10 +206,11 @@ func UploadToYouTube(channel *models.Channel, video *models.Video, isShorts bool
 		return "", err
 	}
 	uploadReq.Header.Set("Content-Type", "video/mp4")
-	uploadReq.Header.Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+	uploadReq.ContentLength = fileInfo.Size() // Go ignores a hand-set Content-Length header and would stream chunked
 
-	// High timeout for large file uploads
-	uploadClient := &http.Client{Timeout: 10 * time.Minute}
+	// Long-form renders can be well over 1 GB - 10 minutes wasn't enough
+	// on an ordinary uplink.
+	uploadClient := &http.Client{Timeout: 90 * time.Minute}
 	uploadResp, err := uploadClient.Do(uploadReq)
 	if err != nil {
 		return "", err
@@ -235,4 +236,58 @@ func UploadToYouTube(channel *models.Channel, video *models.Video, isShorts bool
 
 	log.Printf("Successfully uploaded video to YouTube with ID: %s", youtubeVideo.ID)
 	return youtubeVideo.ID, nil
+}
+
+// YouTube rejects (400 invalidTitle/invalidDescription/invalidTags) titles
+// over 100 characters, descriptions over 5000 bytes, tag lists over 500
+// characters, and any "<" or ">" - all of which LLM-written metadata hits
+// regularly. These keep an otherwise-good upload from failing on metadata.
+func youtubeSanitize(s string) string {
+	return strings.NewReplacer("<", "", ">", "").Replace(strings.TrimSpace(s))
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return strings.TrimSpace(string(r[:max]))
+}
+
+func youtubeTitle(title string) string {
+	t := truncateRunes(youtubeSanitize(title), 100)
+	if t == "" {
+		t = "Novo vídeo"
+	}
+	return t
+}
+
+func youtubeDescription(desc string) string {
+	d := youtubeSanitize(desc)
+	for len(d) > 5000 {
+		r := []rune(d)
+		d = string(r[:len(r)-100])
+	}
+	return d
+}
+
+func youtubeTags(raw string) []string {
+	var tags []string
+	total := 0
+	for _, t := range strings.Split(raw, ",") {
+		t = strings.Trim(youtubeSanitize(t), "#\" ")
+		if t == "" {
+			continue
+		}
+		cost := len([]rune(t))
+		if strings.Contains(t, " ") {
+			cost += 2 // YouTube counts the quotes it adds around multi-word tags
+		}
+		if total+cost+len(tags) > 500 {
+			break
+		}
+		total += cost
+		tags = append(tags, t)
+	}
+	return tags
 }

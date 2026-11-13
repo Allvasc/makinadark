@@ -3,14 +3,26 @@ package services
 import (
 	"fmt"
 	"log"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"makinadark/backend/internal/config"
 	"makinadark/backend/internal/db"
 	"makinadark/backend/internal/models"
 )
+
+// autopilotRunning holds the IDs of channels with a cycle in flight. A full
+// cycle (script + 35-55 scenes + render) routinely outlasts the 10-minute
+// tick, and every tick used to start another goroutine for the same channel
+// - duplicate videos and doubled API spend.
+var autopilotRunning sync.Map
+
+// autopilotMaxQueued is how many unpublished auto-pilot videos may be waiting
+// (generating/scheduled) before the engine stops producing more. Without it
+// the engine produced a whole week's quota in about an hour.
+const autopilotMaxQueued = 2
 
 // StartAutoPilotEngine starts the background loop that manages channels in Auto-Pilot mode
 func StartAutoPilotEngine() {
@@ -36,8 +48,56 @@ func runAutoPilotCycle() {
 	}
 
 	for _, channel := range channels {
-		go processAutoPilotChannel(channel)
+		if _, busy := autopilotRunning.LoadOrStore(channel.ID, true); busy {
+			log.Printf("Auto-Pilot: channel '%s' still has a cycle in progress, skipping this tick", channel.Name)
+			continue
+		}
+		go func(ch models.Channel) {
+			defer autopilotRunning.Delete(ch.ID)
+			processAutoPilotChannel(ch)
+		}(channel)
 	}
+}
+
+// recordAutoPilotSkip notes why a cycle deliberately did nothing. It's not a
+// failure (no backoff), but it IS shown in the UI - otherwise an enabled
+// auto-pilot that never produces anything looks simply broken.
+func recordAutoPilotSkip(cfg *models.AutoPilotConfig, reason string) {
+	now := time.Now()
+	cfg.LastSkipReason = reason
+	cfg.LastCheckedAt = &now
+	db.DB.Model(&models.AutoPilotConfig{}).Where("id = ?", cfg.ID).Updates(map[string]interface{}{
+		"last_skip_reason": reason,
+		"last_checked_at":  &now,
+	})
+}
+
+// nextAutoPilotSlot spreads posts evenly across the week instead of putting
+// every video at "tomorrow, preferred hour". Up to 7/week: at most one per
+// day, every ceil(7/n) days, always at the preferred hour. More than 7/week:
+// evenly spaced hours starting from the preferred hour.
+func nextAutoPilotSlot(channelID string, videosPerWeek, preferredHour int, now time.Time) time.Time {
+	interval := (7 * 24 * time.Hour) / time.Duration(videosPerWeek)
+	earliest := now.Add(1 * time.Hour)
+
+	var last models.Video
+	err := db.DB.Where("channel_id = ? AND scheduled_for IS NOT NULL AND status IN ?", channelID,
+		[]string{models.VideoStatusScheduled, models.VideoStatusPosting, models.VideoStatusPosted}).
+		Order("scheduled_for desc").First(&last).Error
+	if err == nil && last.ScheduledFor != nil {
+		if next := last.ScheduledFor.Add(interval); next.After(earliest) {
+			earliest = next
+		}
+	}
+
+	if videosPerWeek <= 7 {
+		slot := time.Date(earliest.Year(), earliest.Month(), earliest.Day(), preferredHour, 0, 0, 0, earliest.Location())
+		if slot.Before(earliest) {
+			slot = slot.AddDate(0, 0, 1)
+		}
+		return slot
+	}
+	return earliest.Truncate(time.Hour).Add(time.Hour)
 }
 
 func processAutoPilotChannel(channel models.Channel) {
@@ -67,6 +127,24 @@ func processAutoPilotChannel(channel models.Channel) {
 		}
 	}
 
+	// 0c. Nothing can be published without a linked account. Producing
+	// videos anyway just burned paid API calls on content that could only
+	// fail at publish time.
+	if !ChannelCanPublish(&channel) {
+		recordAutoPilotSkip(&cfg, "Nenhuma conta de postagem conectada - conecte o YouTube ou o TikTok para o Piloto Automático produzir vídeos.")
+		return
+	}
+
+	// 0d. Keep only a small buffer of unpublished videos.
+	var queued int64
+	db.DB.Model(&models.Video{}).
+		Where("channel_id = ? AND status IN ?", channel.ID, []string{models.VideoStatusGenerating, models.VideoStatusScheduled, models.VideoStatusPosting}).
+		Count(&queued)
+	if queued >= autopilotMaxQueued {
+		recordAutoPilotSkip(&cfg, fmt.Sprintf("Fila cheia: %d vídeo(s) aguardando publicação - o próximo será produzido quando a fila andar.", queued))
+		return
+	}
+
 	videosPerWeek := cfg.VideosPerWeek
 	if videosPerWeek <= 0 {
 		videosPerWeek = 7
@@ -85,8 +163,10 @@ func processAutoPilotChannel(channel models.Channel) {
 	if videosThisWeek >= int64(videosPerWeek) {
 		log.Printf("Auto-Pilot: channel '%s' already reached its weekly cap (%d/%d videos in the last 7 days), skipping this cycle",
 			channel.Name, videosThisWeek, videosPerWeek)
+		recordAutoPilotSkip(&cfg, fmt.Sprintf("Limite semanal atingido (%d/%d vídeos nos últimos 7 dias).", videosThisWeek, videosPerWeek))
 		return
 	}
+	recordAutoPilotSkip(&cfg, "")
 
 	// 1. Fetch channel's recent videos and analytics
 	var recentVideos []models.Video
@@ -124,6 +204,11 @@ func processAutoPilotChannel(channel models.Channel) {
 	liveTrends, _ := FetchRealTimeTrends(channel.ID, channel.Niche)
 	trendsSummary := "Tendências de busca em alta hoje: " + strings.Join(liveTrends, ", ")
 
+	// Same no-repeat rule the manual flow uses (video_creation.go) - the
+	// auto-pilot never told the LLM what the channel had already covered.
+	var existingTitles []string
+	db.DB.Model(&models.Video{}).Where("channel_id = ?", channel.ID).Order("created_at desc").Limit(50).Pluck("title", &existingTitles)
+
 	// 3. Ask AI to analyze metrics + trends and decide next high-CTR topic
 	prompt := fmt.Sprintf(`Você é o Gerente Autônomo de Inteligência Artificial do canal dark '%s' (Nicho: '%s').
 Analise as métricas recentes de desempenho do canal e as tendências de pesquisa em tempo real:
@@ -132,10 +217,14 @@ Analise as métricas recentes de desempenho do canal e as tendências de pesquis
 - Tópico com maior engajamento recente: '%s'
 - %s
 
-Com base nesses dados de tendências ao vivo e retenção, escolha o assunto do PRÓXIMO VÍDEO que surfará nas maiores buscas de hoje com a maior taxa de cliques. Retorne apenas o assunto em texto simples.`,
-		channel.Name, channel.Niche, avgCTR, avgRetention, topPerformingTopic, trendsSummary)
+- Vídeos já criados neste canal: %v
+
+Com base nesses dados de tendências ao vivo e retenção, escolha o assunto do PRÓXIMO VÍDEO que surfará nas maiores buscas de hoje com a maior taxa de cliques.
+REGRA OBRIGATÓRIA: o assunto deve ser inédito - nunca repita um tema da lista de vídeos já criados. Retorne apenas o assunto em texto simples.`,
+		channel.Name, channel.Niche, avgCTR, avgRetention, topPerformingTopic, trendsSummary, existingTitles)
 
 	nextTopic, err := CallLLM(channel.ID, videoID, prompt)
+	nextTopic = strings.Trim(strings.TrimSpace(nextTopic), "\"")
 	if err != nil || nextTopic == "" {
 		if len(liveTrends) > 0 {
 			nextTopic = liveTrends[0]
@@ -182,8 +271,7 @@ Com base nesses dados de tendências ao vivo e retenção, escolha o assunto do 
 	// otherwise we render for real locally with FFmpeg (the same pipeline the
 	// manual "Gerar Vídeo Completo" button uses) - never substitute a random
 	// stock clip and pretend it's the rendered video.
-	shotstackKey := os.Getenv("SHOTSTACK_API_KEY")
-	if shotstackKey != "" && shotstackKey != "your_shotstack_api_key_here" {
+	if config.IsSet(config.AppConfig.ShotstackAPIKey) {
 		// Shotstack doesn't report per-scene fallback usage back, so it's
 		// computed here from the same data submitShotstackRender uses to pick
 		// assets - a scene with no visual and/or no narration audio degrades
@@ -234,9 +322,9 @@ Com base nesses dados de tendências ao vivo e retenção, escolha o assunto do 
 	// 6. Automatically approve and schedule video post for tomorrow at the channel's preferred hour
 	// (video.VideoPath/ShortsPath were already set above, by whichever render path ran)
 	now := time.Now()
-	scheduledDate := time.Date(now.Year(), now.Month(), now.Day()+1, preferredHour, 0, 0, 0, now.Location())
+	scheduledDate := nextAutoPilotSlot(channel.ID, videosPerWeek, preferredHour, now)
 
-	video.Status = "scheduled"
+	video.Status = models.VideoStatusScheduled
 	video.ScheduledFor = &scheduledDate
 	video.UpdatedAt = time.Now()
 	db.DB.Save(&video)

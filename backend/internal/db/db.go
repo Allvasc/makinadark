@@ -1,10 +1,13 @@
 package db
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -19,20 +22,46 @@ import (
 
 var DB *gorm.DB
 
+// gormLogLevel defaults to Warn: at Info, GORM logs every single query, and
+// the scheduler/watchdog/auto-pilot tickers alone buried every useful log
+// line under a wall of SELECTs. Set DB_LOG_LEVEL=info to debug SQL.
+func gormLogLevel() logger.LogLevel {
+	switch strings.ToLower(os.Getenv("DB_LOG_LEVEL")) {
+	case "info":
+		return logger.Info
+	case "error":
+		return logger.Error
+	case "silent":
+		return logger.Silent
+	default:
+		return logger.Warn
+	}
+}
+
 func InitDB() {
 	var err error
+	gormCfg := &gorm.Config{Logger: logger.Default.LogMode(gormLogLevel())}
 
 	if config.AppConfig.PostgresHost != "" {
 		dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 			config.AppConfig.PostgresHost, config.AppConfig.PostgresPort,
 			config.AppConfig.PostgresUser, config.AppConfig.PostgresPassword, config.AppConfig.PostgresDB)
 
-		log.Printf("Connecting to Postgres at %s:%s/%s...", config.AppConfig.PostgresHost, config.AppConfig.PostgresPort, config.AppConfig.PostgresDB)
-		DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Info),
-		})
-		if err != nil {
-			log.Fatalf("failed to connect to Postgres: %v", err)
+		// Postgres routinely needs a few seconds after its container starts
+		// before it accepts connections - failing hard on the first attempt
+		// made the backend crash-loop on every fresh `docker compose up`.
+		const maxAttempts = 30
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			log.Printf("Connecting to Postgres at %s:%s/%s (attempt %d/%d)...",
+				config.AppConfig.PostgresHost, config.AppConfig.PostgresPort, config.AppConfig.PostgresDB, attempt, maxAttempts)
+			DB, err = gorm.Open(postgres.Open(dsn), gormCfg)
+			if err == nil {
+				break
+			}
+			if attempt == maxAttempts {
+				log.Fatalf("failed to connect to Postgres: %v", err)
+			}
+			time.Sleep(2 * time.Second)
 		}
 		log.Println("Database connection established (Postgres)")
 	} else {
@@ -42,9 +71,7 @@ func InitDB() {
 		}
 		dbPath := filepath.Join(dataDir, "makinadark.db")
 
-		DB, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Info),
-		})
+		DB, err = gorm.Open(sqlite.Open(dbPath), gormCfg)
 		if err != nil {
 			log.Fatalf("failed to connect database: %v", err)
 		}
@@ -72,20 +99,36 @@ func InitDB() {
 	var userCount int64
 	DB.Model(&models.User{}).Count(&userCount)
 	if userCount == 0 {
-		hash, err := auth.HashPassword("makinadark123")
+		password := config.AppConfig.AdminPassword
+		generated := false
+		if password == "" {
+			// No hardcoded default: a publicly known password on an
+			// internet-facing deployment is an open door.
+			buf := make([]byte, 9)
+			if _, err := rand.Read(buf); err != nil {
+				log.Fatalf("failed to generate admin password: %v", err)
+			}
+			password = base64.RawURLEncoding.EncodeToString(buf)
+			generated = true
+		}
+		hash, err := auth.HashPassword(password)
 		if err != nil {
-			log.Printf("Warning: failed to hash default admin password, skipping seed: %v", err)
+			log.Printf("Warning: failed to hash admin password, skipping seed: %v", err)
 			return
 		}
 		defaultUser := models.User{
 			ID:           "admin-001",
-			Email:        "admin@makinadark.com",
+			Email:        config.AppConfig.AdminEmail,
 			PasswordHash: hash,
 			Name:         "Administrador Mákina Dark",
 			CreatedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
 		}
 		DB.Create(&defaultUser)
-		log.Println("Default Admin User seeded: admin@makinadark.com / makinadark123 - change this password after first login")
+		if generated {
+			log.Printf("Admin user seeded: %s / %s (generated - set ADMIN_PASSWORD to choose it; change it in Configurações after login)", defaultUser.Email, password)
+		} else {
+			log.Printf("Admin user seeded: %s (password from ADMIN_PASSWORD)", defaultUser.Email)
+		}
 	}
 }

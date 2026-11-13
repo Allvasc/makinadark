@@ -29,10 +29,9 @@ func main() {
 	}
 
 	// Ensure media folder exists and create subfolders
-	os.MkdirAll("./media/images", 0755)
-	os.MkdirAll("./media/audio", 0755)
-	os.MkdirAll("./media/music", 0755)
-	os.MkdirAll("./media/output", 0755)
+	for _, dir := range []string{"images", "audio", "output", "temp"} {
+		os.MkdirAll("./media/"+dir, 0755)
+	}
 
 	// Start background post scheduler & Auto-Pilot daemon
 	services.StartScheduler()
@@ -43,15 +42,18 @@ func main() {
 		BodyLimit: 100 * 1024 * 1024, // 100MB file upload limit
 	})
 
-	// Configure CORS middleware to connect with frontend
+	// CORS only matters when the frontend is NOT behind the bundled nginx
+	// proxy (e.g. `npm run dev` without its proxy) - same-origin needs none.
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "http://localhost:5173, http://localhost:8080, http://127.0.0.1:5173, http://localhost:3000",
+		AllowOrigins: config.AppConfig.CORSOrigins,
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS", // PUT is used by /api/settings
 	}))
 
-	// Serve static generated assets (images, audio, videos)
-	app.Static("/media", "./media")
+	// Serve static generated assets (images, audio, videos). ByteRange is
+	// required for <video> previews: without Range support browsers can't
+	// seek, and Safari won't play the file at all.
+	app.Static("/media", "./media", fiber.Static{ByteRange: true})
 
 	// Set up routing
 	handlers.SetupRoutes(app)

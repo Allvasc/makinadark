@@ -48,8 +48,8 @@ type Channel struct {
 	IntroProgress      int              `gorm:"default:0" json:"intro_progress"`     // 0-100
 	IntroStage         string           `json:"intro_stage,omitempty"`
 	IntroError         string           `json:"intro_error,omitempty"`
-	OutroStatus        string           `json:"outro_status"`                        // "idle", "generating", "ready", "failed"
-	OutroProgress      int              `gorm:"default:0" json:"outro_progress"`     // 0-100
+	OutroStatus        string           `json:"outro_status"`                    // "idle", "generating", "ready", "failed"
+	OutroProgress      int              `gorm:"default:0" json:"outro_progress"` // 0-100
 	OutroStage         string           `json:"outro_stage,omitempty"`
 	OutroError         string           `json:"outro_error,omitempty"`
 	CreatedAt          time.Time        `json:"created_at"`
@@ -88,6 +88,8 @@ type AutoPilotConfig struct {
 	ConsecutiveFailures int        `gorm:"default:0" json:"consecutive_failures"` // resets to 0 on any successful cycle; drives backoff so a stuck channel doesn't retry every 10 minutes forever
 	LastFailureAt       *time.Time `json:"last_failure_at,omitempty"`
 	LastFailureReason   string     `json:"last_failure_reason,omitempty"`
+	LastSkipReason      string     `json:"last_skip_reason,omitempty"` // why the last cycle intentionally did nothing (no linked account, queue full, weekly cap) - not a failure, so it doesn't feed the backoff
+	LastCheckedAt       *time.Time `json:"last_checked_at,omitempty"`
 }
 
 type Video struct {
@@ -106,6 +108,8 @@ type Video struct {
 	RenderJobID        string         `json:"render_job_id"` // Shotstack/Creatomate Cloud Job ID
 	ScheduledFor       *time.Time     `json:"scheduled_for,omitempty"`
 	PostedAt           *time.Time     `json:"posted_at,omitempty"`
+	YouTubeVideoID     string         `json:"youtube_video_id,omitempty"`        // set once the YouTube upload succeeds (used to live inside error_message)
+	TikTokPublishID    string         `json:"tiktok_publish_id,omitempty"`       // set once the TikTok upload succeeds
 	MediaPurged        bool           `gorm:"default:false" json:"media_purged"` // true once the rendered files were auto-deleted from storage after posting
 	RenderProgress     int            `gorm:"default:0" json:"render_progress"`  // 0-100, only meaningful while status == "generating"
 	RenderStage        string         `json:"render_stage,omitempty"`            // human-readable current step, e.g. "Renderizando cena 3 de 7"
@@ -118,15 +122,29 @@ type Video struct {
 	CTRScore           int            `gorm:"default:92" json:"ctr_score"`
 	OriginalityScore   int            `gorm:"default:95" json:"originality_score"`
 	ScoreNotes         string         `json:"score_notes,omitempty"`
-	MusicMood          string         `json:"music_mood,omitempty"`                    // "suspense", "business", or "ambient" - decided by the Sonoplastia agent, overrides niche keyword-matching
-	MusicMixLevel      float64        `gorm:"default:0.12" json:"music_mix_level"`     // background music volume relative to narration (0.05-0.25), decided by the Sonoplastia agent
+	MusicMood          string         `json:"music_mood,omitempty"`                     // "suspense", "business", or "ambient" - decided by the Sonoplastia agent, overrides niche keyword-matching
+	MusicMixLevel      float64        `gorm:"default:0.12" json:"music_mix_level"`      // background music volume relative to narration (0.05-0.25), decided by the Sonoplastia agent
 	UseFadeTransitions bool           `gorm:"default:true" json:"use_fade_transitions"` // whether scenes fade in/out at cuts for a more dramatic feel - decided by the Diretor agent
-	AgentNotes         string         `json:"agent_notes,omitempty"`                   // last supervisor feedback per stage, semicolon-joined, for operator visibility
+	AgentNotes         string         `json:"agent_notes,omitempty"`                    // last supervisor feedback per stage, semicolon-joined, for operator visibility
 	CreatedAt          time.Time      `json:"created_at"`
 	UpdatedAt          time.Time      `json:"updated_at"`
 	Scenes             []Scene        `gorm:"foreignKey:VideoID" json:"scenes,omitempty"`
 	Analytics          *AnalyticsData `gorm:"foreignKey:VideoID" json:"analytics,omitempty"`
+	SceneCount         int            `gorm:"-" json:"scene_count"`            // filled by list endpoints, which no longer preload every scene of every video
+	ChannelName        string         `gorm:"-" json:"channel_name,omitempty"` // filled by the calendar endpoint
 }
+
+// Video statuses. "posting" is a transient claim held while uploads run, so
+// two scheduler ticks can never publish the same video twice.
+const (
+	VideoStatusGenerating = "generating"
+	VideoStatusDraft      = "draft"
+	VideoStatusReady      = "ready"
+	VideoStatusScheduled  = "scheduled"
+	VideoStatusPosting    = "posting"
+	VideoStatusPosted     = "posted"
+	VideoStatusFailed     = "failed"
+)
 
 type Scene struct {
 	ID            string    `gorm:"primaryKey" json:"id"`

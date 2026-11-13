@@ -18,17 +18,17 @@ import (
 	"makinadark/backend/internal/models"
 )
 
-const tiktokCodeVerifier = "makinadark_pkce_code_verifier_98765432101234567890_secret_string"
-
 func generateCodeChallenge(verifier string) string {
 	hash := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
-// GetTikTokAuthURL generates TikTok OAuth2 login URL with PKCE S256
-func GetTikTokAuthURL(channelID string) string {
+// GetTikTokAuthURL generates the TikTok OAuth2 login URL with PKCE S256.
+// state is the signed value from auth.SignOAuthState and codeVerifier the
+// per-flow verifier derived from it (auth.PKCEVerifier).
+func GetTikTokAuthURL(state, codeVerifier string) string {
 	baseURL := "https://www.tiktok.com/v2/auth/authorize/"
-	codeChallenge := generateCodeChallenge(tiktokCodeVerifier)
+	codeChallenge := generateCodeChallenge(codeVerifier)
 
 	params := url.Values{}
 	params.Add("client_key", config.AppConfig.TikTokClientID)
@@ -36,7 +36,7 @@ func GetTikTokAuthURL(channelID string) string {
 	// TikTok Content Posting API scopes
 	params.Add("scope", "user.info.basic,video.upload,video.publish")
 	params.Add("redirect_uri", config.AppConfig.RedirectURI)
-	params.Add("state", fmt.Sprintf("tiktok:%s", channelID))
+	params.Add("state", state)
 	params.Add("code_challenge", codeChallenge)
 	params.Add("code_challenge_method", "S256")
 
@@ -44,7 +44,7 @@ func GetTikTokAuthURL(channelID string) string {
 }
 
 // ExchangeTikTokCode exchanges OAuth2 authorization code for TikTok tokens
-func ExchangeTikTokCode(code string) (*TokenResponse, error) {
+func ExchangeTikTokCode(code, codeVerifier string) (*TokenResponse, error) {
 	tokenURL := "https://open.tiktokapis.com/v2/oauth/token/"
 
 	params := url.Values{}
@@ -53,7 +53,7 @@ func ExchangeTikTokCode(code string) (*TokenResponse, error) {
 	params.Add("code", code)
 	params.Add("grant_type", "authorization_code")
 	params.Add("redirect_uri", config.AppConfig.RedirectURI)
-	params.Add("code_verifier", tiktokCodeVerifier)
+	params.Add("code_verifier", codeVerifier)
 
 	resp, err := http.PostForm(tokenURL, params)
 	if err != nil {
@@ -146,10 +146,27 @@ type TikTokInitResponse struct {
 	} `json:"error"`
 }
 
-// UploadToTikTok uploads the video (preferably Shorts format) to TikTok API
-func UploadToTikTok(channel *models.Channel, video *models.Video) (string, error) {
+// tiktokChunkPlan follows TikTok's FILE_UPLOAD rules: files under 5 MB (and
+// up to 64 MB) go as one chunk; larger files are split into chunks of 5-64
+// MB where total_chunk_count = floor(size / chunk_size) and the final chunk
+// absorbs the remainder (it may be up to 128 MB). The old code always sent a
+// single chunk, which TikTok rejects for anything over 64 MB - i.e. most
+// real renders.
+func tiktokChunkPlan(size int64) (chunkSize int64, chunkCount int64) {
+	const maxSingle = 64 * 1024 * 1024
+	const chunk = 10 * 1024 * 1024
+	if size <= maxSingle {
+		return size, 1
+	}
+	return chunk, size / chunk
+}
+
+// UploadToTikTok uploads a local video file (the 9:16 short) through the
+// TikTok Content Posting API. localPath must be a file on disk (see
+// localCopy) - the stored ShortsPath may be an R2 URL.
+func UploadToTikTok(channel *models.Channel, video *models.Video, localPath string) (string, error) {
 	// 1. Check/Refresh token
-	if time.Now().After(channel.TikTokTokenExpiry) {
+	if channel.TikTokAccessToken == "" || time.Now().After(channel.TikTokTokenExpiry.Add(-2*time.Minute)) {
 		log.Printf("TikTok access token expired for channel %s, refreshing...", channel.Name)
 		tokenResp, err := RefreshTikTokToken(channel.TikTokRefreshToken)
 		if err != nil {
@@ -160,41 +177,37 @@ func UploadToTikTok(channel *models.Channel, video *models.Video) (string, error
 			channel.TikTokRefreshToken = tokenResp.RefreshToken
 		}
 		channel.TikTokTokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		db.DB.Save(channel)
+		db.DB.Model(&models.Channel{}).Where("id = ?", channel.ID).Updates(map[string]interface{}{
+			"tik_tok_access_token":  channel.TikTokAccessToken,
+			"tik_tok_refresh_token": channel.TikTokRefreshToken,
+			"tik_tok_token_expiry":  channel.TikTokTokenExpiry,
+		})
 	}
 
-	// Shorts path is preferred, fallback to VideoPath
-	videoPath := video.ShortsPath
-	if videoPath == "" {
-		videoPath = video.VideoPath
-	}
-
-	if _, err := os.Stat(videoPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("video file does not exist: %s", videoPath)
-	}
-
-	fileInfo, err := os.Stat(videoPath)
+	fileInfo, err := os.Stat(localPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("video file does not exist: %s", localPath)
 	}
+	size := fileInfo.Size()
+	chunkSize, chunkCount := tiktokChunkPlan(size)
 
 	// Step 1: Initialize upload request on TikTok Creator API
 	initURL := "https://open.tiktokapis.com/v2/post/publish/video/init/"
 
 	initBody := map[string]interface{}{
 		"post_info": map[string]interface{}{
-			"title":            video.Title, // Caption
-			"privacy_level":    "PUBLIC_TO_EVERYONE",
-			"disable_duet":     false,
-			"disable_stitch":   false,
-			"disable_comment":  false,
+			"title":                    truncateRunes(video.Title, 150), // caption limit is 2200 UTF-16 units; keep it short and readable
+			"privacy_level":            "PUBLIC_TO_EVERYONE",
+			"disable_duet":             false,
+			"disable_stitch":           false,
+			"disable_comment":          false,
 			"video_cover_timestamp_ms": 1000,
 		},
 		"source_info": map[string]interface{}{
-			"source":             "FILE_UPLOAD",
-			"video_size":         fileInfo.Size(),
-			"chunk_size":         fileInfo.Size(), // Single chunk upload for smaller short files
-			"total_chunk_count":  1,
+			"source":            "FILE_UPLOAD",
+			"video_size":        size,
+			"chunk_size":        chunkSize,
+			"total_chunk_count": chunkCount,
 		},
 	}
 
@@ -237,38 +250,45 @@ func UploadToTikTok(channel *models.Channel, video *models.Video) (string, error
 
 	uploadURL := initResp.Data.UploadURL
 	publishID := initResp.Data.PublishID
+	if uploadURL == "" {
+		return "", fmt.Errorf("tiktok api did not return an upload_url")
+	}
 
-	// Step 2: Upload the video binary
-	file, err := os.Open(videoPath)
+	// Step 2: Upload the video binary, chunk by chunk
+	file, err := os.Open(localPath)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 
-	// TikTok expects PUT to the upload_url with specific headers
-	uploadReq, err := http.NewRequest("PUT", uploadURL, file)
-	if err != nil {
-		return "", err
-	}
-	// TikTok requires Content-Range header for the video chunk
-	uploadReq.Header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", fileInfo.Size()-1, fileInfo.Size()))
-	uploadReq.Header.Set("Content-Type", "video/mp4")
+	uploadClient := &http.Client{Timeout: 30 * time.Minute}
+	for i := int64(0); i < chunkCount; i++ {
+		start := i * chunkSize
+		end := start + chunkSize - 1
+		if i == chunkCount-1 {
+			end = size - 1 // last chunk takes the remainder
+		}
+		length := end - start + 1
 
-	uploadClient := &http.Client{Timeout: 10 * time.Minute}
-	uploadResp, err := uploadClient.Do(uploadReq)
-	if err != nil {
-		return "", err
-	}
-	defer uploadResp.Body.Close()
+		uploadReq, err := http.NewRequest("PUT", uploadURL, io.NewSectionReader(file, start, length))
+		if err != nil {
+			return "", err
+		}
+		uploadReq.ContentLength = length
+		uploadReq.Header.Set("Content-Type", "video/mp4")
+		uploadReq.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 
-	uploadRespBody, err := io.ReadAll(uploadResp.Body)
-	if err != nil {
-		return "", err
-	}
+		uploadResp, err := uploadClient.Do(uploadReq)
+		if err != nil {
+			return "", fmt.Errorf("tiktok chunk %d/%d upload failed: %w", i+1, chunkCount, err)
+		}
+		body, _ := io.ReadAll(uploadResp.Body)
+		uploadResp.Body.Close()
 
-	// Status 201 Created or 200 OK is expected depending on chunk uploads
-	if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("failed to upload video binary to TikTok, status %d: %s", uploadResp.StatusCode, string(uploadRespBody))
+		// 206 Partial Content for intermediate chunks, 201 Created when done.
+		if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated && uploadResp.StatusCode != http.StatusPartialContent {
+			return "", fmt.Errorf("failed to upload chunk %d/%d to TikTok, status %d: %s", i+1, chunkCount, uploadResp.StatusCode, string(body))
+		}
 	}
 
 	log.Printf("Successfully published video to TikTok with Publish ID: %s", publishID)

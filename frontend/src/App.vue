@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount, computed } from 'vue'
 
 // Same-origin, relative paths - nginx.conf proxies /api and /media to the
 // backend container. This works unmodified whether the frontend is served
@@ -44,6 +44,20 @@ const authMode = ref('login') // 'login' | 'register'
 const authForm = reactive({ email: '', password: '', name: '' })
 const authError = ref('')
 const isAuthenticating = ref(false)
+// Sign-up is off by default on the server (every account uses the
+// operator's paid API keys) - only show "Criar Conta" when it's enabled.
+const registrationEnabled = ref(false)
+
+// Parses a JSON body without throwing on empty/non-JSON responses (e.g. an
+// nginx 502 page), so callers can always show `data.error || HTTP <code>`.
+const readJSON = async (res) => {
+  try {
+    return await res.json()
+  } catch {
+    return {}
+  }
+}
+const errorText = (res, data) => data?.error || `HTTP ${res.status}`
 
 // Wrapper around fetch that attaches the Bearer token and logs the user out
 // on a 401 (expired/invalid token) instead of silently failing every call.
@@ -62,17 +76,18 @@ const logout = () => {
   currentUserName.value = ''
   localStorage.removeItem('makinadark_token')
   localStorage.removeItem('makinadark_user_name')
+  currentTab.value = 'channels'
   channels.value = []
   activeChannel.value = null
   activeVideo.value = null
-  if (renderPollingId.value) {
-    clearInterval(renderPollingId.value)
-    renderPollingId.value = null
-  }
-  if (videoListPollingId.value) {
-    clearTimeout(videoListPollingId.value)
-    videoListPollingId.value = null
-  }
+  showBookendsPage.value = false
+  channelCosts.value = null
+  autoPilotStatus.value = null
+  videos.value = []
+  allScheduledVideos.value = []
+  stopRenderPolling()
+  stopVideoListPolling()
+  stopChannelPolling()
 }
 
 const submitAuth = async () => {
@@ -85,7 +100,7 @@ const submitAuth = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(authForm)
     })
-    const data = await res.json()
+    const data = await readJSON(res)
     if (!res.ok) {
       authError.value = data.error || 'Falha na autenticação.'
       return
@@ -103,9 +118,31 @@ const submitAuth = async () => {
   }
 }
 
-// Load channels on mount if already logged in
-onMounted(() => {
+// The OAuth popup (backend /api/oauth/callback page) posts a message to its
+// opener when it finishes, so the "Conectado" badge updates without a reload.
+const onOAuthMessage = async (event) => {
+  if (event.origin !== window.location.origin) return
+  if (event.data?.type !== 'makinadark-oauth' || !activeChannel.value) return
+  await refreshActiveChannel()
+  await fetchAutoPilotStatus(activeChannel.value.id)
+}
+
+onMounted(async () => {
+  window.addEventListener('message', onOAuthMessage)
+  try {
+    const res = await fetch(`${API_BASE}/auth/config`)
+    if (res.ok) registrationEnabled.value = !!(await res.json()).registration_enabled
+  } catch {
+    // backend unreachable - the login form will report it on submit
+  }
   if (authToken.value) fetchChannels()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('message', onOAuthMessage)
+  stopVideoListPolling()
+  stopChannelPolling()
+  stopRenderPolling()
 })
 
 const fetchChannels = async () => {
@@ -124,6 +161,14 @@ const fetchChannels = async () => {
 const videoListPollingId = ref(null)
 const channelPollingId = ref(null)
 
+const syncChannelInList = (updated) => {
+  if (!updated || !updated.id) return
+  const idx = channels.value.findIndex(c => c.id === updated.id)
+  if (idx !== -1) {
+    channels.value[idx] = updated
+  }
+}
+
 const startChannelPolling = (channelId) => {
   if (channelPollingId.value) return
   channelPollingId.value = setInterval(async () => {
@@ -136,6 +181,7 @@ const startChannelPolling = (channelId) => {
       if (res.ok) {
         const updated = await res.json()
         activeChannel.value = updated
+        syncChannelInList(updated)
         if (updated.intro_script && !introScriptInput.value) {
           introScriptInput.value = updated.intro_script
         }
@@ -173,9 +219,31 @@ const fetchVideos = async (channelId) => {
     clearTimeout(videoListPollingId.value)
     videoListPollingId.value = null
   }
-  if (activeChannel.value && !activeVideo.value && videos.value.some(v => v.status === 'generating')) {
+  if (activeChannel.value && activeChannel.value.id === channelId && !activeVideo.value && videos.value.some(v => isBusyStatus(v.status))) {
     videoListPollingId.value = setTimeout(() => fetchVideos(channelId), 4000)
   }
+}
+
+// "posting" is the transient state while the backend uploads to
+// YouTube/TikTok - it needs live polling just like "generating".
+const isBusyStatus = (status) => status === 'generating' || status === 'posting'
+
+const refreshActiveChannel = async () => {
+  if (!activeChannel.value) return null
+  try {
+    const res = await apiFetch(`/channels/${activeChannel.value.id}`)
+    if (res.ok) {
+      const fresh = await res.json()
+      if (activeChannel.value && activeChannel.value.id === fresh.id) {
+        activeChannel.value = fresh
+      }
+      syncChannelInList(fresh)
+      return fresh
+    }
+  } catch (err) {
+    console.error('Error refreshing channel:', err)
+  }
+  return null
 }
 
 const stopVideoListPolling = () => {
@@ -186,6 +254,7 @@ const stopVideoListPolling = () => {
 }
 
 const selectChannel = async (channel) => {
+  stopChannelPolling()
   activeChannel.value = channel
   activeVideo.value = null
   showBookendsPage.value = false
@@ -193,12 +262,113 @@ const selectChannel = async (channel) => {
   narratorVoiceSaved.value = false
   introScriptInput.value = channel.intro_script || ''
   outroScriptInput.value = channel.outro_script || ''
-  await fetchVideos(channel.id)
-  await fetchChannelCosts(channel.id)
-  await fetchAutoPilotStatus(channel.id)
-  await fetchNarratorVoices()
-  if (channel.intro_status === 'generating' || channel.outro_status === 'generating') {
+  try {
+    const res = await apiFetch(`/channels/${channel.id}`)
+    if (res.ok) {
+      const fresh = await res.json()
+      activeChannel.value = fresh
+      syncChannelInList(fresh)
+      narratorVoiceSelection.value = fresh.narrator_voice_id || ''
+      introScriptInput.value = fresh.intro_script || ''
+      outroScriptInput.value = fresh.outro_script || ''
+    }
+  } catch (err) {
+    console.error('Error refreshing channel:', err)
+  }
+  await Promise.all([
+    fetchVideos(channel.id),
+    fetchChannelCosts(channel.id),
+    fetchAutoPilotStatus(channel.id),
+    fetchNarratorVoices(),
+  ])
+  if (activeChannel.value && (activeChannel.value.intro_status === 'generating' || activeChannel.value.outro_status === 'generating')) {
     startChannelPolling(channel.id)
+  }
+}
+
+const openBookendsPage = async () => {
+  if (!activeChannel.value) return
+  showBookendsPage.value = true
+  const fresh = await refreshActiveChannel()
+  if (fresh) {
+    if (fresh.intro_script) introScriptInput.value = fresh.intro_script
+    if (fresh.outro_script) outroScriptInput.value = fresh.outro_script
+    if (fresh.intro_status === 'generating' || fresh.outro_status === 'generating') {
+      startChannelPolling(fresh.id)
+    }
+  }
+}
+
+// --- Contas de postagem (OAuth) -------------------------------------------
+// The backend now hands out the consent URL from an authenticated endpoint
+// (with a signed state) instead of a public link anyone could hit.
+const connectingProvider = ref('')
+
+const connectAccount = async (provider) => {
+  if (!activeChannel.value) return
+  // Open the popup synchronously (inside the click) so it isn't blocked,
+  // then point it at the consent URL once the backend returns it.
+  const popup = window.open('about:blank', '_blank', 'width=560,height=720')
+  connectingProvider.value = provider
+  try {
+    const res = await apiFetch(`/channels/${activeChannel.value.id}/oauth/${provider}`)
+    const data = await readJSON(res)
+    if (!res.ok || !data.url) {
+      if (popup) popup.close()
+      alert('Não foi possível iniciar a conexão: ' + errorText(res, data))
+      return
+    }
+    if (!popup) {
+      window.location.href = data.url
+      return
+    }
+    popup.location.href = data.url
+    // Fallback for when the callback page runs on another origin (e.g.
+    // REDIRECT_URI pointing straight at the backend port) and its
+    // postMessage is ignored: refresh once the popup closes.
+    const channelId = activeChannel.value.id
+    const watcher = setInterval(async () => {
+      if (!popup.closed) return
+      clearInterval(watcher)
+      if (activeChannel.value && activeChannel.value.id === channelId) {
+        await refreshActiveChannel()
+        await fetchAutoPilotStatus(channelId)
+      }
+    }, 1000)
+  } catch (err) {
+    if (popup) popup.close()
+    alert('Erro de conexão ao iniciar a vinculação da conta.')
+  } finally {
+    connectingProvider.value = ''
+  }
+}
+
+const disconnectAccount = async (provider) => {
+  if (!activeChannel.value) return
+  const label = provider === 'youtube' ? 'YouTube' : 'TikTok'
+  if (!confirm(`Desconectar a conta do ${label} deste canal? Vídeos agendados não poderão ser publicados nele.`)) return
+  const res = await apiFetch(`/channels/${activeChannel.value.id}/oauth/${provider}`, { method: 'DELETE' })
+  const data = await readJSON(res)
+  if (res.ok) {
+    activeChannel.value = data
+    syncChannelInList(data)
+    await fetchAutoPilotStatus(data.id)
+  } else {
+    alert('Erro ao desconectar: ' + errorText(res, data))
+  }
+}
+
+const deleteChannel = async () => {
+  if (!activeChannel.value) return
+  const ch = activeChannel.value
+  if (!confirm(`Excluir o canal "${ch.name}" com TODOS os vídeos, imagens e arquivos? Essa ação não pode ser desfeita.`)) return
+  const res = await apiFetch(`/channels/${ch.id}`, { method: 'DELETE' })
+  const data = await readJSON(res)
+  if (res.ok) {
+    goBackToChannels()
+    channels.value = channels.value.filter(c => c.id !== ch.id)
+  } else {
+    alert('Erro ao excluir o canal: ' + errorText(res, data))
   }
 }
 
@@ -230,14 +400,17 @@ const updateNarratorVoice = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ voice_id: narratorVoiceSelection.value }),
     })
+    const data = await res.json().catch(() => ({}))
     if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
+      activeChannel.value = data
+      syncChannelInList(data)
       narratorVoiceSaved.value = true
-      await fetchChannels()
+    } else {
+      alert('Erro ao atualizar narrador: ' + (data.error || `HTTP ${res.status}`))
     }
   } catch (err) {
     console.error('Error updating narrator voice:', err)
+    alert('Erro de conexão ao atualizar narrador.')
   }
 }
 
@@ -280,7 +453,14 @@ const formatUSD = (value) => {
 }
 
 const providerLabel = (provider) => {
-  const labels = { openai: 'OpenAI', gemini: 'Gemini', elevenlabs: 'ElevenLabs', pexels: 'Pexels' }
+  const labels = {
+    openai: 'OpenAI',
+    gemini: 'Gemini',
+    groq: 'Groq',
+    anthropic: 'Claude (Anthropic)',
+    elevenlabs: 'ElevenLabs',
+    pexels: 'Pexels',
+  }
   return labels[provider] || provider
 }
 
@@ -302,22 +482,28 @@ const goBackToChannels = () => {
   stopChannelPolling()
 }
 
+const toLocalDateTimeInput = (isoString) => {
+  if (!isoString) return ''
+  const d = new Date(isoString)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 const selectVideo = async (video) => {
   stopVideoListPolling()
   try {
     const res = await apiFetch(`/videos/${video.id}`)
     if (res.ok) {
       activeVideo.value = await res.json()
-      // Setup scheduler date if already set
-      if (activeVideo.value.scheduled_for) {
-        scheduleDate.value = new Date(activeVideo.value.scheduled_for).toISOString().slice(0, 16)
-      } else {
-        scheduleDate.value = ''
-      }
-      
-      // Start polling if video is in rendering/generating state
-      if (activeVideo.value.status === 'generating') {
+      // Format in local timezone so <input type="datetime-local"> doesn't shift UTC
+      scheduleDate.value = toLocalDateTimeInput(activeVideo.value.scheduled_for)
+
+      // Start polling if video is being generated/rendered/published
+      if (isBusyStatus(activeVideo.value.status)) {
         startRenderPolling(activeVideo.value.id)
+      } else {
+        stopRenderPolling()
       }
     }
   } catch (err) {
@@ -328,227 +514,148 @@ const selectVideo = async (video) => {
 const goBackToChannel = () => {
   activeVideo.value = null
   showBookendsPage.value = false
-  if (renderPollingId.value) {
-    clearInterval(renderPollingId.value)
-    renderPollingId.value = null
+  stopRenderPolling()
+  if (activeChannel.value) {
+    fetchVideos(activeChannel.value.id)
+    fetchChannelCosts(activeChannel.value.id)
+    fetchAutoPilotStatus(activeChannel.value.id)
   }
-  fetchVideos(activeChannel.value.id)
 }
 
 // Actions
-const createAutoChannel = async () => {
+const submitNewChannel = async (payload) => {
   isGeneratingChannel.value = true
   try {
     const res = await apiFetch('/channels', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: '',
-        niche: 'Curiosidades e Mistérios'
-      })
+      body: JSON.stringify(payload)
     })
-    if (res.ok) {
-      const created = await res.json()
-      await fetchChannels()
-      selectChannel(created)
+    const data = await readJSON(res)
+    if (!res.ok) {
+      alert('Erro ao conceber canal: ' + errorText(res, data))
+      return false
     }
-  } catch (err) {
-    alert('Erro ao gerar o canal autônomo por IA.')
-  } finally {
-    isGeneratingChannel.value = false
-  }
-}
-
-const createChannel = async () => {
-  isGeneratingChannel.value = true
-  try {
-    const res = await apiFetch('/channels', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: newChannel.name,
-        niche: newChannel.niche
-      })
-    })
-    if (res.ok) {
-      const created = await res.json()
-      await fetchChannels()
-      showCreateChannelModal.value = false
-      newChannel.name = ''
-      // select the newly created channel
-      selectChannel(created)
+    const created = data.channel || data
+    await fetchChannels()
+    await selectChannel(created)
+    if (data.warning) {
+      alert('Canal criado, mas parte da identidade visual falhou:\n' + data.warning + '\n\nVocê pode regerar o logo/capa na página do canal.')
     }
+    return true
   } catch (err) {
     alert('Erro ao gerar canal por IA. Certifique-se de que o backend está ativo.')
+    return false
   } finally {
     isGeneratingChannel.value = false
   }
 }
 
-const generateBranding = async () => {
-  if (!activeChannel.value) return
-  isGeneratingChannel.value = true
-  try {
-    const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-branding`, {
-      method: 'POST'
-    })
-    if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
-      await fetchChannels()
-    }
-  } catch (err) {
-    alert('Erro ao gerar a identidade visual.')
-  } finally {
-    isGeneratingChannel.value = false
+const createAutoChannel = () => submitNewChannel({ name: '', niche: 'Curiosidades e Mistérios' })
+
+const createChannel = async () => {
+  const ok = await submitNewChannel({ name: newChannel.name.trim(), niche: newChannel.niche })
+  if (ok) {
+    showCreateChannelModal.value = false
+    newChannel.name = ''
   }
 }
 
-const generateLogo = async () => {
+const regenerateChannelImage = async (kind) => {
   if (!activeChannel.value) return
-  isGeneratingLogo.value = true
+  const loading = kind === 'logo' ? isGeneratingLogo : isGeneratingBanner
+  loading.value = true
   try {
-    const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-logo`, {
-      method: 'POST'
-    })
-    const data = await res.json()
+    const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-${kind}`, { method: 'POST' })
+    const data = await readJSON(res)
     if (res.ok) {
       activeChannel.value = data
-      await fetchChannels()
+      syncChannelInList(data)
     } else {
-      alert('Erro ao gerar logotipo: ' + (data.error || `HTTP ${res.status}`))
+      alert(`Erro ao gerar ${kind === 'logo' ? 'o logotipo' : 'a capa do canal'}: ` + errorText(res, data))
     }
   } catch (err) {
-    alert('Erro ao gerar logotipo: ' + err.message)
+    alert('Erro de conexão ao gerar a imagem: ' + err.message)
   } finally {
-    isGeneratingLogo.value = false
+    loading.value = false
   }
 }
 
-const generateBanner = async () => {
+const generateLogo = () => regenerateChannelImage('logo')
+const generateBanner = () => regenerateChannelImage('banner')
+
+const bookendState = {
+  intro: { loading: isGeneratingIntro, deleting: isDeletingIntro, input: introScriptInput, label: 'a abertura' },
+  outro: { loading: isGeneratingOutro, deleting: isDeletingOutro, input: outroScriptInput, label: 'o encerramento' },
+}
+
+const generateBookend = async (kind) => {
   if (!activeChannel.value) return
-  isGeneratingBanner.value = true
+  const st = bookendState[kind]
+  st.loading.value = true
   try {
-    const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-banner`, {
-      method: 'POST'
+    const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script: st.input.value }),
     })
-    const data = await res.json()
+    const data = await readJSON(res)
     if (res.ok) {
       activeChannel.value = data
-      await fetchChannels()
+      syncChannelInList(data)
+      startChannelPolling(data.id)
     } else {
-      alert('Erro ao gerar a capa do canal: ' + (data.error || `HTTP ${res.status}`))
+      alert(`Erro ao gerar ${st.label}: ` + errorText(res, data))
     }
   } catch (err) {
-    alert('Erro ao gerar a capa do canal: ' + err.message)
+    alert(`Erro de conexão ao gerar ${st.label}.`)
   } finally {
-    isGeneratingBanner.value = false
+    st.loading.value = false
   }
 }
 
-const generateIntro = async () => {
-  if (!activeChannel.value) return
-  isGeneratingIntro.value = true
+const deleteBookend = async (kind) => {
+  const st = bookendState[kind]
+  if (!activeChannel.value || !confirm(`Tem certeza que deseja excluir ${st.label} deste canal?`)) return
+  st.deleting.value = true
   try {
-    const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-intro`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ script: introScriptInput.value }),
-    })
+    const res = await apiFetch(`/channels/${activeChannel.value.id}/${kind}`, { method: 'DELETE' })
+    const data = await readJSON(res)
     if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
-      introScriptInput.value = updated.intro_script || ''
-      startChannelPolling(activeChannel.value.id)
-      await fetchChannels()
+      activeChannel.value = data
+      syncChannelInList(data)
+      st.input.value = ''
     } else {
-      const data = await res.json()
-      alert(data.error || 'Erro ao gerar abertura.')
+      alert(`Erro ao excluir ${st.label}: ` + errorText(res, data))
     }
   } catch (err) {
-    alert('Erro de conexão ao gerar abertura.')
+    alert(`Erro de conexão ao excluir ${st.label}.`)
   } finally {
-    isGeneratingIntro.value = false
+    st.deleting.value = false
   }
 }
 
-const generateOutro = async () => {
-  if (!activeChannel.value) return
-  isGeneratingOutro.value = true
-  try {
-    const res = await apiFetch(`/channels/${activeChannel.value.id}/generate-outro`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ script: outroScriptInput.value }),
-    })
-    if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
-      outroScriptInput.value = updated.outro_script || ''
-      startChannelPolling(activeChannel.value.id)
-      await fetchChannels()
-    } else {
-      const data = await res.json()
-      alert(data.error || 'Erro ao gerar encerramento.')
-    }
-  } catch (err) {
-    alert('Erro de conexão ao gerar encerramento.')
-  } finally {
-    isGeneratingOutro.value = false
-  }
+const generateIntro = () => generateBookend('intro')
+const generateOutro = () => generateBookend('outro')
+const deleteIntro = () => deleteBookend('intro')
+const deleteOutro = () => deleteBookend('outro')
+
+// Real extension of a stored file (logos are PNG, banners JPEG) so the
+// downloaded file isn't misnamed.
+const fileExt = (path, fallback) => {
+  const m = /\.([a-z0-9]{2,4})(?:\?|$)/i.exec(path || '')
+  return m ? `.${m[1].toLowerCase()}` : fallback
 }
 
-const deleteIntro = async () => {
-  if (!activeChannel.value || !confirm('Tem certeza que deseja excluir a abertura deste canal?')) return
-  isDeletingIntro.value = true
-  try {
-    const res = await apiFetch(`/channels/${activeChannel.value.id}/intro`, {
-      method: 'DELETE',
-    })
-    if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
-      introScriptInput.value = ''
-      await fetchChannels()
-    } else {
-      const data = await res.json()
-      alert(data.error || 'Erro ao excluir abertura.')
-    }
-  } catch (err) {
-    alert('Erro de conexão ao excluir abertura.')
-  } finally {
-    isDeletingIntro.value = false
-  }
-}
-
-const deleteOutro = async () => {
-  if (!activeChannel.value || !confirm('Tem certeza que deseja excluir o encerramento deste canal?')) return
-  isDeletingOutro.value = true
-  try {
-    const res = await apiFetch(`/channels/${activeChannel.value.id}/outro`, {
-      method: 'DELETE',
-    })
-    if (res.ok) {
-      const updated = await res.json()
-      activeChannel.value = updated
-      outroScriptInput.value = ''
-      await fetchChannels()
-    } else {
-      const data = await res.json()
-      alert(data.error || 'Erro ao excluir encerramento.')
-    }
-  } catch (err) {
-    alert('Erro de conexão ao excluir encerramento.')
-  } finally {
-    isDeletingOutro.value = false
-  }
-}
+const slugify = (text, fallback) => (text || fallback).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || fallback
 
 const downloadMediaFile = async (path, defaultFilename) => {
   if (!path) return
   try {
     const fullUrl = formatRelativePath(path)
     const response = await fetch(fullUrl)
+    // Without this check a 404/502 page was silently "downloaded" as the file.
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const blob = await response.blob()
     const blobUrl = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -568,6 +675,7 @@ const downloadMediaFile = async (path, defaultFilename) => {
 }
 
 const generateVideo = async () => {
+  if (!activeChannel.value) return
   isGeneratingVideo.value = true
   try {
     const res = await apiFetch(`/channels/${activeChannel.value.id}/videos`, {
@@ -577,11 +685,13 @@ const generateVideo = async () => {
         topic: newVideoTopic.value
       })
     })
+    const data = await res.json().catch(() => ({}))
     if (res.ok) {
-      const createdVideo = await res.json()
       newVideoTopic.value = ''
       await fetchVideos(activeChannel.value.id)
-      selectVideo(createdVideo)
+      selectVideo(data)
+    } else {
+      alert('Erro ao gerar roteiro: ' + (data.error || `HTTP ${res.status}`))
     }
   } catch (err) {
     alert('Erro ao gerar o roteiro. Tente novamente.')
@@ -596,44 +706,74 @@ const toggleAutoPilot = async () => {
     const res = await apiFetch(`/channels/${activeChannel.value.id}/toggle-autopilot`, {
       method: 'POST'
     })
+    const data = await readJSON(res)
     if (res.ok) {
-      const data = await res.json()
       activeChannel.value.autopilot_enabled = data.autopilot_enabled
+      syncChannelInList({ ...activeChannel.value })
+      await fetchAutoPilotStatus(activeChannel.value.id)
+    } else {
+      alert('Erro ao alterar Piloto Automático: ' + (data.error || `HTTP ${res.status}`))
     }
   } catch (err) {
     console.error('Error toggling autopilot:', err)
+    alert('Erro de conexão ao alterar Piloto Automático.')
   }
 }
 
+const isRendering = ref(false)
+
 const triggerRender = async () => {
-  if (!activeVideo.value) return
+  if (!activeVideo.value || isRendering.value) return
+  isRendering.value = true
   try {
     const res = await apiFetch(`/videos/${activeVideo.value.id}/render`, {
       method: 'POST'
     })
+    const data = await readJSON(res)
     if (res.ok) {
       activeVideo.value.status = 'generating'
+      activeVideo.value.render_progress = 0
+      activeVideo.value.render_stage = 'Iniciando renderização...'
+      activeVideo.value.error_message = ''
       startRenderPolling(activeVideo.value.id)
+    } else {
+      alert('Erro ao iniciar renderização: ' + errorText(res, data))
     }
   } catch (err) {
     console.error('Error triggering render:', err)
+    alert('Erro de conexão ao iniciar renderização.')
+  } finally {
+    isRendering.value = false
+  }
+}
+
+const stopRenderPolling = () => {
+  if (renderPollingId.value) {
+    clearInterval(renderPollingId.value)
+    renderPollingId.value = null
   }
 }
 
 const startRenderPolling = (videoId) => {
-  if (renderPollingId.value) clearInterval(renderPollingId.value)
+  stopRenderPolling()
   renderPollingId.value = setInterval(async () => {
+    if (!activeVideo.value || activeVideo.value.id !== videoId) {
+      stopRenderPolling()
+      return
+    }
     try {
       const res = await apiFetch(`/videos/${videoId}`)
       if (res.ok) {
         const updated = await res.json()
         if (activeVideo.value && activeVideo.value.id === videoId) {
           activeVideo.value = updated
-          if (updated.status !== 'generating') {
-            clearInterval(renderPollingId.value)
-            renderPollingId.value = null
+          if (!isBusyStatus(updated.status)) {
+            stopRenderPolling()
+            scheduleDate.value = toLocalDateTimeInput(updated.scheduled_for)
           }
         }
+      } else if (res.status === 404) {
+        stopRenderPolling()
       }
     } catch (err) {
       console.error('Error polling render status:', err)
@@ -642,21 +782,46 @@ const startRenderPolling = (videoId) => {
 }
 
 const scheduleVideo = async () => {
-  if (!scheduleDate.value) return
+  if (!activeVideo.value) return
+  if (!scheduleDate.value) {
+    alert('Selecione uma data e hora para agendar a postagem.')
+    return
+  }
+  const parsed = new Date(scheduleDate.value)
+  if (Number.isNaN(parsed.getTime())) {
+    alert('Data ou hora inválida.')
+    return
+  }
   try {
     const res = await apiFetch(`/videos/${activeVideo.value.id}/schedule`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        scheduled_for: new Date(scheduleDate.value).toISOString()
+        scheduled_for: parsed.toISOString()
       })
     })
+    const data = await readJSON(res)
     if (res.ok) {
-      activeVideo.value = await res.json()
+      activeVideo.value = data
+      scheduleDate.value = toLocalDateTimeInput(data.scheduled_for)
       alert('Vídeo agendado com sucesso!')
+    } else {
+      alert('Erro ao agendar o vídeo: ' + errorText(res, data))
     }
   } catch (err) {
     alert('Erro ao agendar o vídeo.')
+  }
+}
+
+const unscheduleVideo = async () => {
+  if (!activeVideo.value || !confirm('Cancelar o agendamento desta publicação?')) return
+  const res = await apiFetch(`/videos/${activeVideo.value.id}/unschedule`, { method: 'POST' })
+  const data = await readJSON(res)
+  if (res.ok) {
+    activeVideo.value = data
+    scheduleDate.value = ''
+  } else {
+    alert('Erro ao cancelar o agendamento: ' + errorText(res, data))
   }
 }
 
@@ -665,6 +830,7 @@ const deleteVideo = async (video, event) => {
   if (!confirm(`Excluir o vídeo "${video.title}" e todos os seus arquivos (imagens, áudio, vídeo renderizado)? Essa ação não pode ser desfeita.`)) return
   try {
     const res = await apiFetch(`/videos/${video.id}`, { method: 'DELETE' })
+    const data = await readJSON(res)
     if (res.ok) {
       if (activeVideo.value && activeVideo.value.id === video.id) {
         goBackToChannel()
@@ -672,7 +838,7 @@ const deleteVideo = async (video, event) => {
         await fetchVideos(activeChannel.value.id)
       }
     } else {
-      alert('Erro ao excluir o vídeo.')
+      alert('Erro ao excluir o vídeo: ' + errorText(res, data))
     }
   } catch (err) {
     alert('Erro ao excluir o vídeo.')
@@ -686,7 +852,42 @@ const settingsStatus = reactive({
   elevenlabs_configured: false,
   youtube_configured: false,
   tiktok_configured: false,
+  groq_configured: false,
+  claude_configured: false,
+  redirect_uri: '',
 })
+
+// --- Change password ----------------------------------------------------
+const passwordForm = reactive({ current: '', next: '', confirm: '' })
+const isChangingPassword = ref(false)
+
+const changePassword = async () => {
+  if (passwordForm.next.length < 8) {
+    alert('A nova senha precisa ter pelo menos 8 caracteres.')
+    return
+  }
+  if (passwordForm.next !== passwordForm.confirm) {
+    alert('A confirmação não confere com a nova senha.')
+    return
+  }
+  isChangingPassword.value = true
+  try {
+    const res = await apiFetch('/auth/password', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current_password: passwordForm.current, new_password: passwordForm.next }),
+    })
+    const data = await readJSON(res)
+    if (res.ok) {
+      passwordForm.current = passwordForm.next = passwordForm.confirm = ''
+      alert('Senha alterada com sucesso.')
+    } else {
+      alert('Erro ao alterar a senha: ' + errorText(res, data))
+    }
+  } finally {
+    isChangingPassword.value = false
+  }
+}
 const settingsForm = reactive({
   openai_api_key: '',
   gemini_api_key: '',
@@ -757,7 +958,7 @@ const saveSettings = async () => {
       await fetchSettings()
       alert('Chaves de API atualizadas no backend!')
     } else {
-      alert('Erro ao salvar as chaves.')
+      alert('Erro ao salvar as chaves: ' + errorText(res, await readJSON(res)))
     }
   } catch (err) {
     alert('Erro ao salvar as chaves.')
@@ -766,66 +967,68 @@ const saveSettings = async () => {
   }
 }
 
-// Calendar Calculation
+// Calendar: one request for the visible month (the backend joins channel
+// names), instead of downloading every channel's full video list - with
+// every scene - just to find the scheduled ones.
 const allScheduledVideos = ref([])
+const calendarMonth = ref(new Date(new Date().getFullYear(), new Date().getMonth(), 1))
+const isLoadingCalendar = ref(false)
 
 const fetchAllVideosForCalendar = async () => {
+  const from = calendarMonth.value
+  const to = new Date(from.getFullYear(), from.getMonth() + 1, 1)
+  isLoadingCalendar.value = true
   try {
-    const allVideos = []
-    for (const ch of channels.value) {
-      const res = await apiFetch(`/channels/${ch.id}/videos`)
-      if (res.ok) {
-        const vList = await res.json()
-        vList.forEach(v => {
-          if (v.scheduled_for) {
-            allVideos.push({
-              ...v,
-              channelName: ch.name
-            })
-          }
-        })
-      }
+    const res = await apiFetch(`/calendar?from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}`)
+    if (res.ok) {
+      allScheduledVideos.value = await res.json()
     }
-    allScheduledVideos.value = allVideos
   } catch (err) {
     console.error('Error loading calendar videos:', err)
+  } finally {
+    isLoadingCalendar.value = false
   }
 }
+
+const shiftCalendarMonth = async (delta) => {
+  const m = calendarMonth.value
+  calendarMonth.value = new Date(m.getFullYear(), m.getMonth() + delta, 1)
+  await fetchAllVideosForCalendar()
+}
+
+const goToCalendarToday = async () => {
+  const now = new Date()
+  calendarMonth.value = new Date(now.getFullYear(), now.getMonth(), 1)
+  await fetchAllVideosForCalendar()
+}
+
+// The day a post belongs to: when it went out if published, else its slot.
+const calendarPostDate = (v) => new Date(v.posted_at || v.scheduled_for)
 
 const calendarDays = computed(() => {
   const days = []
   const today = new Date()
-  const year = today.getFullYear()
-  const month = today.getMonth()
+  const year = calendarMonth.value.getFullYear()
+  const month = calendarMonth.value.getMonth()
 
-  // First day of current month
-  const firstDay = new Date(year, month, 1)
-  const startDayOfWeek = firstDay.getDay() // 0 = Sunday, 1 = Monday etc.
-
-  // Total days in current month
+  const startDayOfWeek = new Date(year, month, 1).getDay() // 0 = Sunday
   const totalDays = new Date(year, month + 1, 0).getDate()
 
-  // Prepend empty slots for padding
   for (let i = 0; i < startDayOfWeek; i++) {
     days.push({ dayNum: null, date: null, posts: [] })
   }
 
-  // Populate days
   for (let day = 1; day <= totalDays; day++) {
-    const dateObj = new Date(year, month, day)
-    
-    // Filter posts for this specific day
     const posts = allScheduledVideos.value.filter(v => {
-      const schedDate = new Date(v.scheduled_for)
-      return schedDate.getDate() === day &&
-             schedDate.getMonth() === month &&
-             schedDate.getFullYear() === year
+      const d = calendarPostDate(v)
+      return d.getDate() === day && d.getMonth() === month && d.getFullYear() === year
     })
-
     days.push({
       dayNum: day,
-      date: dateObj,
-      isToday: day === today.getDate(),
+      date: new Date(year, month, day),
+      // Must compare month/year too - with month navigation "the 13th" of
+      // every month used to be highlighted as today.
+      isToday: day === today.getDate() && month === today.getMonth() && year === today.getFullYear(),
       posts
     })
   }
@@ -838,7 +1041,19 @@ const getMonthName = () => {
     'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
     'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
   ]
-  return months[new Date().getMonth()] + ' ' + new Date().getFullYear()
+  return months[calendarMonth.value.getMonth()] + ' ' + calendarMonth.value.getFullYear()
+}
+
+const openCalendarPost = async (post) => {
+  let ch = channels.value.find(c => c.id === post.channel_id)
+  if (!ch) {
+    await fetchChannels()
+    ch = channels.value.find(c => c.id === post.channel_id)
+  }
+  if (!ch) return
+  currentTab.value = 'channels'
+  await selectChannel(ch)
+  await selectVideo(post)
 }
 
 const changeTab = async (tab) => {
@@ -856,16 +1071,37 @@ const formatRelativePath = (path) => {
   if (/^https?:\/\//i.test(path)) return path
   // Normalize Windows backslashes and make url complete for the local-disk fallback
   const normalized = path.replace(/\\/g, '/')
-  return `${MEDIA_BASE}/${normalized.replace('media/', '')}`
+  return `${MEDIA_BASE}/${normalized.replace(/^(\.?\/)?media\//, '')}`
 }
 
 const formatNicheLabel = (niche) => {
+  if (!niche) return ''
   return niche.substring(0, 1).toUpperCase() + niche.substring(1)
 }
 
 const getStatusBadgeClass = (status) => {
   return `badge badge-${status}`
 }
+
+// The UI is Portuguese; raw status codes ("draft", "ready"...) leaked into it.
+const STATUS_LABELS = {
+  generating: 'Gerando',
+  draft: 'Rascunho',
+  ready: 'Pronto',
+  scheduled: 'Agendado',
+  posting: 'Publicando',
+  posted: 'Publicado',
+  failed: 'Falhou',
+}
+const statusLabel = (status) => STATUS_LABELS[status] || status
+
+// error_message on a posted video holds a non-fatal note (e.g. TikTok failed
+// but YouTube worked) - it shouldn't look like a fatal error.
+const isWarningOnly = (video) => video && (video.status === 'posted' || video.status === 'ready' || video.status === 'scheduled')
+
+// Re-render is only possible while the scene source files still exist (they
+// are purged after a successful render to save storage).
+const canRender = (video) => video && (video.status === 'draft' || video.status === 'failed') && (video.scenes || []).some(s => s.image_path || s.video_clip_url || s.audio_path)
 </script>
 
 <template>
@@ -879,7 +1115,7 @@ const getStatusBadgeClass = (status) => {
         Mákina <span>Dark</span>
       </div>
 
-      <div style="display: flex; gap: 0.5rem; margin-bottom: 1.5rem;">
+      <div v-if="registrationEnabled" style="display: flex; gap: 0.5rem; margin-bottom: 1.5rem;">
         <button type="button" class="btn" :class="authMode === 'login' ? 'btn-primary' : 'btn-secondary'" style="flex: 1;" @click="authMode = 'login'; authError = ''">Entrar</button>
         <button type="button" class="btn" :class="authMode === 'register' ? 'btn-primary' : 'btn-secondary'" style="flex: 1;" @click="authMode = 'register'; authError = ''">Criar Conta</button>
       </div>
@@ -967,12 +1203,12 @@ const getStatusBadgeClass = (status) => {
       <section v-if="currentTab === 'channels'">
         <!-- Channels Main View -->
         <div v-if="!activeChannel">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+          <div class="flex-wrap-header">
             <div>
               <h1>Canais Gerados</h1>
               <p style="color: var(--text-secondary);">Cadastre e gerencie a identidade visual e o conteúdo de cada canal.</p>
             </div>
-            <div style="display: flex; gap: 0.75rem;">
+            <div style="display: flex; flex-wrap: wrap; gap: 0.75rem;">
               <button @click="createAutoChannel" :disabled="isGeneratingChannel" class="btn btn-primary" style="background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); border: none; box-shadow: 0 4px 20px rgba(6, 182, 212, 0.4);">
                 <span v-if="isGeneratingChannel" class="spinner"></span>
                 <span v-else>🚀 Gerar Canal 100% Automático (Sem Pensar)</span>
@@ -984,12 +1220,12 @@ const getStatusBadgeClass = (status) => {
           </div>
 
           <div class="grid-cols-3" v-if="channels.length > 0">
-            <div v-for="ch in channels" :key="ch.id" @click="selectChannel(ch)" class="card" style="cursor: pointer; display: flex; flex-direction: column; gap: 1rem;">
+            <div v-for="ch in channels" :key="ch.id" @click="selectChannel(ch)" class="card card-clickable" style="display: flex; flex-direction: column; gap: 1rem;">
               <div style="display: flex; align-items: center; gap: 1rem;">
                 <div v-if="ch.logo_path" class="channel-logo-avatar" :style="{ backgroundImage: `url(${formatRelativePath(ch.logo_path)})` }"></div>
-                <div v-else class="channel-logo-avatar-placeholder">{{ ch.name.substring(0, 2).toUpperCase() }}</div>
-                <div>
-                  <h3 style="font-weight: 700; margin-bottom: 0.25rem;">{{ ch.name }}</h3>
+                <div v-else class="channel-logo-avatar-placeholder">{{ (ch.name || 'CH').substring(0, 2).toUpperCase() }}</div>
+                <div style="min-width: 0;">
+                  <h3 style="font-weight: 700; margin-bottom: 0.25rem; word-break: break-word;">{{ ch.name }}</h3>
                   <span class="badge" style="background: rgba(139, 92, 246, 0.15); color: var(--accent-purple);">{{ ch.niche }}</span>
                 </div>
               </div>
@@ -1015,18 +1251,23 @@ const getStatusBadgeClass = (status) => {
 
         <!-- Channel Detail View (Main Overview) -->
         <div v-else-if="activeChannel && !showBookendsPage && !activeVideo">
-          <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1.5rem; color: var(--text-secondary); cursor: pointer;" @click="goBackToChannels">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
-            </svg>
-            Voltar para canais
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 1.5rem;">
+            <div style="display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); cursor: pointer;" @click="goBackToChannels">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+              </svg>
+              Voltar para canais
+            </div>
+            <button type="button" @click="deleteChannel" class="btn btn-secondary" style="font-size: 0.8rem; color: #f87171; border-color: rgba(248, 113, 113, 0.3);">
+              Excluir Canal
+            </button>
           </div>
 
           <!-- Channel Branding Banner Card -->
           <div class="channel-banner-preview" :style="{ backgroundImage: activeChannel.banner_path ? `url(${formatRelativePath(activeChannel.banner_path)})` : 'linear-gradient(135deg, #1e1b4b 0%, #311042 100%)' }">
             <div class="channel-logo-overlay" :style="{ backgroundImage: activeChannel.logo_path ? `url(${formatRelativePath(activeChannel.logo_path)})` : 'none' }">
               <span v-if="!activeChannel.logo_path" style="display:flex; height:100%; align-items:center; justify-content:center; font-weight:800; font-size:1.5rem; color:var(--text-muted);">
-                {{ activeChannel.name.substring(0, 2).toUpperCase() }}
+                {{ (activeChannel.name || 'CH').substring(0, 2).toUpperCase() }}
               </span>
             </div>
           </div>
@@ -1049,8 +1290,8 @@ const getStatusBadgeClass = (status) => {
             </div>
           </div>
 
-          <div style="margin-top: 1rem; display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 3rem;">
-            <div style="max-width: 60%;">
+          <div class="channel-overview-layout">
+            <div style="min-width: 0;">
               <h1 style="font-size: 2rem;">{{ activeChannel.name }}</h1>
               <p style="color: var(--accent-purple); font-weight: 600; margin-bottom: 0.5rem;">Nicho: {{ formatNicheLabel(activeChannel.niche) }}</p>
               <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">{{ activeChannel.concept }}</p>
@@ -1060,7 +1301,7 @@ const getStatusBadgeClass = (status) => {
                 <h4 style="font-weight: 700; font-size: 0.95rem; margin-bottom: 1rem; color: var(--accent-cyan); display: flex; align-items: center; gap: 0.5rem;">
                   ⚙️ Configurações & Persona Escolhidas pela IA
                 </h4>
-                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;">
+                <div class="channel-persona-grid">
                   <div style="background: rgba(255,255,255,0.03); padding: 0.75rem 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
                     <span style="font-size: 0.75rem; color: var(--text-muted); display: block; margin-bottom: 0.25rem;">Persona do Canal</span>
                     <strong style="font-size: 0.85rem; color: #f4f4f5;">{{ activeChannel.persona || 'Investigador Enigmático' }}</strong>
@@ -1092,14 +1333,20 @@ const getStatusBadgeClass = (status) => {
               </div>
 
               <!-- Auto-Pilot Banner -->
-              <div style="margin-top: 1.5rem; background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.2); padding: 1rem 1.25rem; border-radius: 14px; display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
-                <div>
+              <div class="channel-bar-row" style="margin-top: 1.5rem; background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.2); padding: 1rem 1.25rem; border-radius: 14px;">
+                <div style="flex: 1; min-width: 220px;">
                   <h4 style="font-weight: 700; font-size: 0.95rem; color: var(--text-primary); display: flex; align-items: center; gap: 0.5rem;">
                     <span style="width: 8px; height: 8px; border-radius: 50%;" :style="{ background: activeChannel.autopilot_enabled ? 'var(--success)' : 'var(--text-muted)' }"></span>
                     Piloto Automático por IA (Auto-Pilot)
                   </h4>
                   <p style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.25rem;">
-                    {{ activeChannel.autopilot_enabled ? 'Ativo: A IA analiza métricas do YouTube/TikTok, escolhe o tema otimizado, busca vídeos HD sem marca d\'água, renderiza na nuvem e agenda postagens sem intervenção humana.' : 'Inativo: Ative para permitir que a IA gerencie a linha editorial e publique vídeos 100% no automático.' }}
+                    {{ activeChannel.autopilot_enabled ? 'Ativo: a IA escolhe temas inéditos em alta, gera roteiro, narração e cenas, renderiza e agenda as postagens distribuídas ao longo da semana (máx. 2 vídeos na fila).' : 'Inativo: ative para a IA gerenciar a linha editorial e publicar vídeos no automático.' }}
+                  </p>
+                  <p v-if="activeChannel.autopilot_enabled && autoPilotStatus && autoPilotStatus.can_publish === false" style="font-size: 0.8rem; color: var(--warning); margin-top: 0.4rem; font-weight: 600;">
+                    ⚠️ Pausado até você conectar o YouTube ou o TikTok abaixo - sem conta vinculada nenhum vídeo é produzido (para não gastar créditos à toa).
+                  </p>
+                  <p v-else-if="activeChannel.autopilot_enabled && autoPilotStatus && autoPilotStatus.last_skip_reason" style="font-size: 0.78rem; color: var(--text-muted); margin-top: 0.4rem;">
+                    Última verificação: {{ autoPilotStatus.last_skip_reason }}
                   </p>
                 </div>
                 <button @click="toggleAutoPilot" class="btn" :class="activeChannel.autopilot_enabled ? 'btn-primary' : 'btn-secondary'" style="flex-shrink: 0;">
@@ -1108,22 +1355,23 @@ const getStatusBadgeClass = (status) => {
               </div>
 
               <!-- Channel OAuth Integrations Bar -->
-              <div style="margin-top: 1rem; background: var(--bg-secondary); border: 1px solid var(--border-color); padding: 1rem 1.25rem; border-radius: 14px; display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
-                <div>
+              <div class="channel-bar-row" style="margin-top: 1rem; background: var(--bg-secondary); border: 1px solid var(--border-color); padding: 1rem 1.25rem; border-radius: 14px;">
+                <div style="flex: 1; min-width: 220px;">
                   <h4 style="font-weight: 700; font-size: 0.95rem; color: var(--text-primary);">Contas de Postagem Vinculadas</h4>
                   <p style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.25rem;">
                     Conecte a conta do YouTube e do TikTok deste canal para habilitar postagens automáticas.
                   </p>
                 </div>
-                <div style="display: flex; gap: 0.75rem; flex-shrink: 0;">
-                  <a :href="`${API_BASE}/channels/${activeChannel.id}/auth/youtube`" target="_blank" class="btn btn-secondary" style="font-size: 0.85rem;">
-                    <span v-if="activeChannel.yt_connected" style="color: var(--success);">✓ YouTube Conectado</span>
-                    <span v-else>+ Conectar YouTube</span>
-                  </a>
-                  <a :href="`${API_BASE}/channels/${activeChannel.id}/auth/tiktok`" target="_blank" class="btn btn-secondary" style="font-size: 0.85rem;">
-                    <span v-if="activeChannel.tiktok_connected" style="color: var(--success);">✓ TikTok Conectado</span>
-                    <span v-else>+ Conectar TikTok</span>
-                  </a>
+                <div style="display: flex; flex-wrap: wrap; gap: 0.75rem; flex-shrink: 0;">
+                  <button v-for="acc in [{ key: 'youtube', label: 'YouTube', connected: activeChannel.yt_connected }, { key: 'tiktok', label: 'TikTok', connected: activeChannel.tiktok_connected }]"
+                          :key="acc.key" type="button" class="btn btn-secondary" style="font-size: 0.85rem;"
+                          :disabled="connectingProvider === acc.key"
+                          :title="acc.connected ? 'Clique para desconectar' : ''"
+                          @click="acc.connected ? disconnectAccount(acc.key) : connectAccount(acc.key)">
+                    <span v-if="connectingProvider === acc.key" class="spinner" style="width: 14px; height: 14px;"></span>
+                    <span v-else-if="acc.connected" style="color: var(--success);">✓ {{ acc.label }} Conectado</span>
+                    <span v-else>+ Conectar {{ acc.label }}</span>
+                  </button>
                 </div>
               </div>
 
@@ -1140,7 +1388,7 @@ const getStatusBadgeClass = (status) => {
                   </div>
                 </div>
 
-                <div style="display: grid; grid-template-columns: 200px 1fr; gap: 1.25rem; align-items: stretch;">
+                <div class="channel-visual-grid">
                   <!-- Logo Card -->
                   <div style="background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border-color); padding: 1rem; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: space-between; text-align: center;">
                     <div style="width: 100%;">
@@ -1148,7 +1396,7 @@ const getStatusBadgeClass = (status) => {
                       <div style="width: 110px; height: 110px; margin: 0 auto 0.75rem auto; border-radius: 50%; overflow: hidden; border: 2px solid var(--border-color); background-size: cover; background-position: center; background-color: #1e1b4b;"
                            :style="{ backgroundImage: activeChannel.logo_path ? `url(${formatRelativePath(activeChannel.logo_path)})` : 'none' }">
                         <span v-if="!activeChannel.logo_path" style="display:flex; height:100%; align-items:center; justify-content:center; font-weight:800; font-size:1.5rem; color:var(--text-muted);">
-                          {{ activeChannel.name.substring(0, 2).toUpperCase() }}
+                          {{ (activeChannel.name || 'CH').substring(0, 2).toUpperCase() }}
                         </span>
                       </div>
                     </div>
@@ -1159,7 +1407,7 @@ const getStatusBadgeClass = (status) => {
                         <span v-else>🎨 {{ activeChannel.logo_path ? 'Regerar Logo' : 'Gerar Logo' }}</span>
                       </button>
 
-                      <button v-if="activeChannel.logo_path" @click="downloadMediaFile(activeChannel.logo_path, `logo-${activeChannel.name.toLowerCase().replace(/\s+/g, '_')}.png`)"
+                      <button v-if="activeChannel.logo_path" @click="downloadMediaFile(activeChannel.logo_path, `logo-${slugify(activeChannel.name, 'canal')}${fileExt(activeChannel.logo_path, '.png')}`)"
                               class="btn btn-primary" style="width: 100%; font-size: 0.8rem; display: flex; align-items: center; justify-content: center; gap: 0.4rem; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); border: none;">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -1172,7 +1420,7 @@ const getStatusBadgeClass = (status) => {
                   </div>
 
                   <!-- Banner / Capa Card -->
-                  <div style="background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border-color); padding: 1rem; border-radius: 12px; display: flex; flex-direction: column; justify-content: space-between;">
+                  <div style="background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border-color); padding: 1rem; border-radius: 12px; display: flex; flex-direction: column; justify-content: space-between; min-width: 0;">
                     <div>
                       <span style="font-size: 0.75rem; color: var(--text-muted); display: block; margin-bottom: 0.75rem; font-weight: 600;">Capa do Canal (Banner 16:9)</span>
                       <div style="width: 100%; height: 130px; margin-bottom: 0.75rem; border-radius: 10px; overflow: hidden; border: 1px solid var(--border-color); background-size: cover; background-position: center; background-color: #1e1b4b;"
@@ -1180,13 +1428,13 @@ const getStatusBadgeClass = (status) => {
                       </div>
                     </div>
 
-                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: 0.5rem;">
+                    <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
                       <button @click="generateBanner" :disabled="isGeneratingBanner" class="btn btn-secondary" style="font-size: 0.8rem; display: flex; align-items: center; gap: 0.4rem; border-color: var(--accent-cyan); color: var(--accent-cyan);">
                         <span v-if="isGeneratingBanner" class="spinner"></span>
                         <span v-else>🎨 {{ activeChannel.banner_path ? 'Regerar Capa' : 'Gerar Capa' }}</span>
                       </button>
 
-                      <button v-if="activeChannel.banner_path" @click="downloadMediaFile(activeChannel.banner_path, `capa-${activeChannel.name.toLowerCase().replace(/\s+/g, '_')}.png`)"
+                      <button v-if="activeChannel.banner_path" @click="downloadMediaFile(activeChannel.banner_path, `capa-${slugify(activeChannel.name, 'canal')}${fileExt(activeChannel.banner_path, '.jpg')}`)"
                               class="btn btn-primary" style="font-size: 0.8rem; display: flex; align-items: center; gap: 0.4rem; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); border: none;">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -1201,13 +1449,13 @@ const getStatusBadgeClass = (status) => {
               </div>
 
               <!-- Dedicated Link Card to open Bookends Page -->
-              <div @click="showBookendsPage = true" class="card" style="cursor: pointer; margin-top: 1.25rem; background: linear-gradient(135deg, rgba(6, 182, 212, 0.08) 0%, rgba(139, 92, 246, 0.08) 100%); border: 1px solid rgba(6, 182, 212, 0.3); padding: 1.25rem; border-radius: 14px; display: flex; align-items: center; justify-content: space-between; gap: 1rem;">
-                <div style="display: flex; align-items: center; gap: 1rem;">
-                  <div style="width: 44px; height: 44px; border-radius: 12px; background: rgba(6, 182, 212, 0.15); display: flex; align-items: center; justify-content: center; font-size: 1.4rem;">
+              <div @click="openBookendsPage" class="card card-clickable channel-bar-row" style="margin-top: 1.25rem; background: linear-gradient(135deg, rgba(6, 182, 212, 0.08) 0%, rgba(139, 92, 246, 0.08) 100%); border: 1px solid rgba(6, 182, 212, 0.3); padding: 1.25rem; border-radius: 14px;">
+                <div style="display: flex; align-items: center; gap: 1rem; flex: 1; min-width: 220px;">
+                  <div style="width: 44px; height: 44px; flex-shrink: 0; border-radius: 12px; background: rgba(6, 182, 212, 0.15); display: flex; align-items: center; justify-content: center; font-size: 1.4rem;">
                     🎬
                   </div>
                   <div>
-                    <h3 style="font-size: 1.05rem; font-weight: 700; color: #f4f4f5; display: flex; align-items: center; gap: 0.6rem;">
+                    <h3 style="font-size: 1.05rem; font-weight: 700; color: #f4f4f5; display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem;">
                       Abertura & Encerramento do Canal
                       <span v-if="activeChannel.intro_video_path && activeChannel.outro_video_path" class="badge" style="background: rgba(16, 185, 129, 0.15); color: var(--success); font-size: 0.75rem;">✓ Prontos</span>
                       <span v-else-if="activeChannel.intro_video_path || activeChannel.outro_video_path" class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; font-size: 0.75rem;">Parcial</span>
@@ -1218,13 +1466,13 @@ const getStatusBadgeClass = (status) => {
                     </p>
                   </div>
                 </div>
-                <button class="btn btn-primary" style="flex-shrink: 0; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); border: none;">
+                <button type="button" class="btn btn-primary" style="flex-shrink: 0; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); border: none;">
                   Gerenciar Abertura e Encerramento →
                 </button>
               </div>
             </div>
             
-            <div class="card" style="width: 380px; padding: 1.25rem;">
+            <div class="card" style="width: 100%; padding: 1.25rem;">
               <h3 style="margin-bottom: 0.5rem; font-size: 1.1rem; font-weight: 700;">Criar Novo Vídeo</h3>
               <p style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 1rem;">
                 Deixe o tema em branco para que a IA busque no <strong>Google Trends</strong> um assunto inédito de alta retenção que <strong>NUNCA</strong> foi feito neste canal antes.
@@ -1250,13 +1498,13 @@ const getStatusBadgeClass = (status) => {
               </div>
             </div>
 
-            <div v-if="channelCosts.gemini_free_tier" style="margin-bottom: 1.25rem; padding: 0.75rem 1rem; border-radius: 10px; display: flex; justify-content: space-between; align-items: center;"
+            <div v-if="channelCosts.gemini_free_tier && channelCosts.gemini_free_tier.configured" style="margin-bottom: 1.25rem; padding: 0.75rem 1rem; border-radius: 10px; display: flex; justify-content: space-between; align-items: center;"
                  :style="{ background: channelCosts.gemini_free_tier.limit_reached ? 'rgba(248, 113, 113, 0.1)' : 'rgba(139, 92, 246, 0.08)', border: channelCosts.gemini_free_tier.limit_reached ? '1px solid rgba(248, 113, 113, 0.3)' : '1px solid rgba(139, 92, 246, 0.2)' }">
               <span style="font-size: 0.85rem;">
-                Cota gratuita do Gemini hoje: <strong>{{ channelCosts.gemini_free_tier.requests_today }}/{{ channelCosts.gemini_free_tier.daily_limit }}</strong> requisições
+                Cota gratuita do Gemini hoje (todos os canais): <strong>{{ channelCosts.gemini_free_tier.requests_today }}/{{ channelCosts.gemini_free_tier.daily_limit }}</strong> requisições
               </span>
               <span v-if="channelCosts.gemini_free_tier.limit_reached" style="font-size: 0.75rem; color: #f87171; font-weight: 700;">
-                LIMITE ATINGIDO - caindo para OpenAI (pago)
+                LIMITE ATINGIDO - as chamadas seguem para o próximo provedor configurado (Claude/OpenAI são pagos)
               </span>
             </div>
 
@@ -1303,7 +1551,7 @@ const getStatusBadgeClass = (status) => {
           <h2 style="font-size: 1.5rem; margin-bottom: 1.5rem; font-weight: 700; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Vídeos do Canal</h2>
           
           <div class="grid-cols-2" v-if="videos.length > 0">
-            <div v-for="v in videos" :key="v.id" @click="selectVideo(v)" class="card" style="cursor: pointer; display: flex; align-items: center; gap: 1.5rem; padding: 1.25rem;">
+            <div v-for="v in videos" :key="v.id" @click="selectVideo(v)" class="card card-clickable" style="display: flex; align-items: center; gap: 1.25rem; padding: 1.25rem;">
               <div class="video-card-thumbnail" :style="{ backgroundImage: v.thumbnail_path ? `url(${formatRelativePath(v.thumbnail_path)})` : 'linear-gradient(135deg, #18181b 0%, #27272a 100%)' }">
                 <div class="play-overlay">
                   <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
@@ -1312,23 +1560,24 @@ const getStatusBadgeClass = (status) => {
                 </div>
               </div>
               
-              <div style="flex-grow: 1; display: flex; flex-direction: column; gap: 0.5rem;">
-                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-                  <h4 style="font-weight: 700; font-size: 1.05rem; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; max-width: 75%;">{{ v.title }}</h4>
-                  <span style="display: flex; align-items: center; gap: 0.4rem;">
+              <div style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem;">
+                  <h4 style="font-weight: 700; font-size: 1.05rem; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;">{{ v.title }}</h4>
+                  <span style="display: flex; align-items: center; gap: 0.4rem; flex-shrink: 0;">
                     <span v-if="v.total_scene_count > 0 && v.degraded_scene_count > 0"
                           :title="v.degraded_scene_count + ' de ' + v.total_scene_count + ' cenas usaram conteúdo de reserva'"
                           :style="{ fontSize: '0.7rem', color: (v.degraded_scene_count / v.total_scene_count > 0.3) ? 'var(--danger)' : 'var(--warning)' }">⚠️</span>
-                    <span :class="getStatusBadgeClass(v.status)">{{ v.status === 'generating' ? `${v.render_progress || 0}%` : v.status }}</span>
+                    <span :class="getStatusBadgeClass(v.status)">{{ v.status === 'generating' ? `${v.render_progress || 0}%` : statusLabel(v.status) }}</span>
                   </span>
                 </div>
                 <p style="font-size: 0.8rem; color: var(--text-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">
                   {{ v.description }}
                 </p>
-                <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted); margin-top: 0.5rem;">
-                  <span>Cenas: {{ v.scenes ? v.scenes.length : 'N/A' }}</span>
-                  <span v-if="v.scheduled_for">Agendado: {{ new Date(v.scheduled_for).toLocaleString() }}</span>
-                  <span v-else>Rascunho</span>
+                <div style="display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; font-size: 0.75rem; color: var(--text-muted); margin-top: 0.5rem;">
+                  <span>Cenas: {{ v.scene_count || v.total_scene_count || 0 }}</span>
+                  <span v-if="v.posted_at">Publicado: {{ new Date(v.posted_at).toLocaleString() }}</span>
+                  <span v-else-if="v.scheduled_for">Agendado: {{ new Date(v.scheduled_for).toLocaleString() }}</span>
+                  <span v-else>{{ statusLabel(v.status) }}</span>
                 </div>
               </div>
               <button @click="deleteVideo(v, $event)" class="btn btn-secondary" title="Excluir vídeo" style="flex-shrink: 0; padding: 0.5rem; color: #f87171; border-color: rgba(248, 113, 113, 0.3);">
@@ -1341,7 +1590,7 @@ const getStatusBadgeClass = (status) => {
           </div>
           
           <div v-else class="card" style="text-align: center; padding: 3rem;">
-            <p style="color: var(--text-muted);">Nenhum vídeo gerado ainda. Digite um tema no painel lateral para gerar o primeiro roteiro.</p>
+            <p style="color: var(--text-muted);">Nenhum vídeo gerado ainda. Use o painel "Criar Novo Vídeo" acima para gerar o primeiro roteiro.</p>
           </div>
         </div>
 
@@ -1403,7 +1652,7 @@ const getStatusBadgeClass = (status) => {
                   </label>
                   <video :src="formatRelativePath(activeChannel.intro_video_path)" controls style="width: 100%; max-height: 240px; border-radius: 12px; background: #000; border: 1px solid var(--border-color);"></video>
                   <div style="margin-top: 0.5rem; text-align: right;">
-                    <button @click="downloadMediaFile(activeChannel.intro_video_path, `abertura-${activeChannel.name.toLowerCase().replace(/\s+/g, '_')}.mp4`)"
+                    <button @click="downloadMediaFile(activeChannel.intro_video_path, `abertura-${slugify(activeChannel.name, 'canal')}.mp4`)"
                             class="btn btn-secondary" style="font-size: 0.78rem;">
                       ⬇️ Baixar Vídeo da Abertura
                     </button>
@@ -1422,11 +1671,11 @@ const getStatusBadgeClass = (status) => {
 
               <!-- Buttons -->
               <div style="display: flex; gap: 0.75rem; border-top: 1px solid var(--border-color); padding-top: 1rem;">
-                <button @click="generateIntro" :disabled="isGeneratingIntro" class="btn btn-primary" style="flex: 1; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); border: none;">
+                <button @click="generateIntro" :disabled="isGeneratingIntro || activeChannel.intro_status === 'generating'" class="btn btn-primary" style="flex: 1; background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%); border: none;">
                   <span v-if="isGeneratingIntro" class="spinner"></span>
                   <span v-else>⚡ {{ activeChannel.intro_video_path ? 'Regerar Abertura' : 'Gerar Abertura' }}</span>
                 </button>
-                <button v-if="activeChannel.intro_video_path || activeChannel.intro_script" @click="deleteIntro" :disabled="isDeletingIntro" class="btn btn-secondary" style="border-color: var(--danger); color: var(--danger);">
+                <button v-if="activeChannel.intro_video_path || activeChannel.intro_script" @click="deleteIntro" :disabled="isDeletingIntro || activeChannel.intro_status === 'generating'" class="btn btn-secondary" style="border-color: var(--danger); color: var(--danger);">
                   <span v-if="isDeletingIntro" class="spinner"></span>
                   <span v-else>🗑️ Excluir</span>
                 </button>
@@ -1472,7 +1721,7 @@ const getStatusBadgeClass = (status) => {
                   </label>
                   <video :src="formatRelativePath(activeChannel.outro_video_path)" controls style="width: 100%; max-height: 240px; border-radius: 12px; background: #000; border: 1px solid var(--border-color);"></video>
                   <div style="margin-top: 0.5rem; text-align: right;">
-                    <button @click="downloadMediaFile(activeChannel.outro_video_path, `encerramento-${activeChannel.name.toLowerCase().replace(/\s+/g, '_')}.mp4`)"
+                    <button @click="downloadMediaFile(activeChannel.outro_video_path, `encerramento-${slugify(activeChannel.name, 'canal')}.mp4`)"
                             class="btn btn-secondary" style="font-size: 0.78rem;">
                       ⬇️ Baixar Vídeo do Encerramento
                     </button>
@@ -1491,11 +1740,11 @@ const getStatusBadgeClass = (status) => {
 
               <!-- Buttons -->
               <div style="display: flex; gap: 0.75rem; border-top: 1px solid var(--border-color); padding-top: 1rem;">
-                <button @click="generateOutro" :disabled="isGeneratingOutro" class="btn btn-primary" style="flex: 1; background: linear-gradient(135deg, #8b5cf6 0%, #06b6d4 100%); border: none;">
+                <button @click="generateOutro" :disabled="isGeneratingOutro || activeChannel.outro_status === 'generating'" class="btn btn-primary" style="flex: 1; background: linear-gradient(135deg, #8b5cf6 0%, #06b6d4 100%); border: none;">
                   <span v-if="isGeneratingOutro" class="spinner"></span>
                   <span v-else>⚡ {{ activeChannel.outro_video_path ? 'Regerar Encerramento' : 'Gerar Encerramento' }}</span>
                 </button>
-                <button v-if="activeChannel.outro_video_path || activeChannel.outro_script" @click="deleteOutro" :disabled="isDeletingOutro" class="btn btn-secondary" style="border-color: var(--danger); color: var(--danger);">
+                <button v-if="activeChannel.outro_video_path || activeChannel.outro_script" @click="deleteOutro" :disabled="isDeletingOutro || activeChannel.outro_status === 'generating'" class="btn btn-secondary" style="border-color: var(--danger); color: var(--danger);">
                   <span v-if="isDeletingOutro" class="spinner"></span>
                   <span v-else>🗑️ Excluir</span>
                 </button>
@@ -1514,44 +1763,49 @@ const getStatusBadgeClass = (status) => {
             Voltar para o Canal
           </div>
 
-          <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 2rem;">
-            <div>
-              <span :class="getStatusBadgeClass(activeVideo.status)" style="margin-bottom: 0.5rem;">{{ activeVideo.status }}</span>
-              <h1 style="font-size: 1.85rem; margin-top: 0.25rem;">{{ activeVideo.title }}</h1>
+          <div class="flex-wrap-header">
+            <div style="min-width: 0;">
+              <span :class="getStatusBadgeClass(activeVideo.status)" style="margin-bottom: 0.5rem;">{{ statusLabel(activeVideo.status) }}</span>
+              <h1 style="font-size: 1.85rem; margin-top: 0.25rem; word-break: break-word;">{{ activeVideo.title }}</h1>
             </div>
             
-            <div style="display: flex; gap: 0.75rem;">
-              <button v-if="activeVideo.status === 'draft' || (activeVideo.status === 'failed' && activeVideo.scenes && activeVideo.scenes.length > 0)" @click="triggerRender" class="btn btn-cyan">
-                {{ activeVideo.status === 'failed' ? 'Tentar Renderizar Novamente' : 'Gerar Vídeo Completo (FFmpeg)' }}
+            <div style="display: flex; flex-wrap: wrap; gap: 0.75rem;">
+              <button v-if="canRender(activeVideo)" @click="triggerRender" :disabled="isRendering" class="btn btn-cyan">
+                <span v-if="isRendering" class="spinner"></span>
+                <span v-else>{{ activeVideo.status === 'failed' ? 'Tentar Renderizar Novamente' : 'Gerar Vídeo Completo (FFmpeg)' }}</span>
               </button>
+              <a v-if="activeVideo.youtube_video_id" :href="`https://www.youtube.com/watch?v=${activeVideo.youtube_video_id}`" target="_blank" rel="noopener" class="btn btn-secondary">
+                ▶ Ver no YouTube
+              </a>
               
-              <div v-if="activeVideo.status === 'ready' || activeVideo.status === 'scheduled'" style="display: flex; gap: 0.75rem;">
-                <a v-if="activeVideo.video_path" :href="formatRelativePath(activeVideo.video_path)" download target="_blank" class="btn btn-secondary">
+              <div v-if="activeVideo.status === 'ready' || activeVideo.status === 'scheduled' || activeVideo.status === 'posted'" style="display: flex; flex-wrap: wrap; gap: 0.75rem;">
+                <button v-if="activeVideo.video_path && !activeVideo.media_purged" @click="downloadMediaFile(activeVideo.video_path, `${slugify(activeVideo.title, 'video')}-16x9.mp4`)" class="btn btn-secondary">
                   Download Vídeo (16:9)
-                </a>
-                <a v-if="activeVideo.shorts_path" :href="formatRelativePath(activeVideo.shorts_path)" download target="_blank" class="btn btn-secondary">
+                </button>
+                <button v-if="activeVideo.shorts_path && !activeVideo.media_purged" @click="downloadMediaFile(activeVideo.shorts_path, `${slugify(activeVideo.title, 'shorts')}-9x16.mp4`)" class="btn btn-secondary">
                   Download Shorts (9:16)
-                </a>
-                <a v-if="activeVideo.subtitles_path" :href="formatRelativePath(activeVideo.subtitles_path)" download target="_blank" class="btn btn-secondary">
+                </button>
+                <button v-if="activeVideo.subtitles_path && !activeVideo.media_purged" @click="downloadMediaFile(activeVideo.subtitles_path, `${slugify(activeVideo.title, 'legendas')}.srt`)" class="btn btn-secondary">
                   Download Legendas (.srt)
-                </a>
+                </button>
                 <span v-if="activeVideo.media_purged" style="font-size: 0.8rem; color: var(--text-muted); align-self: center;">
                   Arquivo removido do armazenamento após publicação
                 </span>
               </div>
 
-              <button @click="deleteVideo(activeVideo)" class="btn btn-secondary" style="color: #f87171; border-color: rgba(248, 113, 113, 0.3);">
+              <button @click="deleteVideo(activeVideo)" :disabled="isBusyStatus(activeVideo.status)" class="btn btn-secondary" style="color: #f87171; border-color: rgba(248, 113, 113, 0.3);">
                 Excluir Vídeo
               </button>
             </div>
           </div>
 
-          <!-- Error message: never shown before, so a failed/blocked video gave no clue why -->
-          <div v-if="activeVideo.error_message" class="card" style="margin-bottom: 1.25rem; padding: 1rem 1.25rem; border: 1px solid rgba(239, 68, 68, 0.35); background: rgba(239, 68, 68, 0.08);">
+          <!-- Error/warning message: a failed/blocked video gave no clue why before -->
+          <div v-if="activeVideo.error_message" class="card" style="margin-bottom: 1.25rem; padding: 1rem 1.25rem;"
+               :style="isWarningOnly(activeVideo) ? 'border: 1px solid rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.08);' : 'border: 1px solid rgba(239, 68, 68, 0.35); background: rgba(239, 68, 68, 0.08);'">
             <div style="display: flex; gap: 0.6rem; align-items: flex-start;">
               <span style="font-size: 1.1rem; line-height: 1;">⚠️</span>
-              <div>
-                <strong style="color: var(--danger); font-size: 0.85rem;">Erro</strong>
+              <div style="min-width: 0; word-break: break-word;">
+                <strong :style="{ color: isWarningOnly(activeVideo) ? 'var(--warning)' : 'var(--danger)', fontSize: '0.85rem' }">{{ isWarningOnly(activeVideo) ? 'Atenção' : 'Erro' }}</strong>
                 <p style="margin: 0.2rem 0 0; font-size: 0.85rem; color: var(--text-secondary);">{{ activeVideo.error_message }}</p>
               </div>
             </div>
@@ -1578,7 +1832,7 @@ const getStatusBadgeClass = (status) => {
 
           <!-- PlaySquad Viral Scorecard Dashboard -->
           <div class="card" style="margin-bottom: 2rem; background: linear-gradient(135deg, rgba(15, 23, 42, 0.9) 0%, rgba(30, 27, 75, 0.6) 100%); border: 1px solid rgba(139, 92, 246, 0.3); padding: 1.5rem; border-radius: 16px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
+            <div class="channel-bar-row" style="margin-bottom: 1.25rem;">
               <div>
                 <h3 style="font-size: 1.15rem; font-weight: 800; color: #f4f4f5; display: flex; align-items: center; gap: 0.6rem;">
                   <span style="font-size: 1.3rem;">📊</span> Scorecard de Viralidade & Análise PlaySquad
@@ -1588,50 +1842,50 @@ const getStatusBadgeClass = (status) => {
                 </p>
               </div>
               <div style="text-align: right; background: rgba(139, 92, 246, 0.15); border: 1px solid rgba(139, 92, 246, 0.4); padding: 0.5rem 1rem; border-radius: 12px;">
-                <span style="font-size: 1.8rem; font-weight: 900; color: var(--accent-cyan);">{{ activeVideo.viral_score || 92 }}/100</span>
+                <span style="font-size: 1.8rem; font-weight: 900; color: var(--accent-cyan);">{{ activeVideo.viral_score ?? 88 }}/100</span>
                 <span style="font-size: 0.75rem; display: block; color: var(--success); font-weight: 700;">POTENCIAL VIRAL EXCELENTE</span>
               </div>
             </div>
 
             <!-- Scorecard Progress Bars -->
-            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.25rem;">
+            <div class="scorecard-grid">
               <div style="background: rgba(255,255,255,0.03); padding: 0.85rem 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
                 <div style="display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.4rem;">
                   <span style="color: var(--text-muted);">⚡ Força do Hook (0-15s)</span>
-                  <strong style="color: var(--accent-cyan);">{{ activeVideo.hook_power_score || 95 }}/100</strong>
+                  <strong style="color: var(--accent-cyan);">{{ activeVideo.hook_power_score ?? 90 }}/100</strong>
                 </div>
                 <div style="width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden;">
-                  <div :style="{ width: (activeVideo.hook_power_score || 95) + '%' }" style="height: 100%; background: var(--accent-cyan);"></div>
+                  <div :style="{ width: (activeVideo.hook_power_score ?? 90) + '%' }" style="height: 100%; background: var(--accent-cyan);"></div>
                 </div>
               </div>
 
               <div style="background: rgba(255,255,255,0.03); padding: 0.85rem 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
                 <div style="display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.4rem;">
                   <span style="color: var(--text-muted);">⏱️ Retenção Est. (AVD)</span>
-                  <strong style="color: var(--accent-purple);">{{ activeVideo.retention_score || 90 }}/100</strong>
+                  <strong style="color: var(--accent-purple);">{{ activeVideo.retention_score ?? 85 }}/100</strong>
                 </div>
                 <div style="width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden;">
-                  <div :style="{ width: (activeVideo.retention_score || 90) + '%' }" style="height: 100%; background: var(--accent-purple);"></div>
+                  <div :style="{ width: (activeVideo.retention_score ?? 85) + '%' }" style="height: 100%; background: var(--accent-purple);"></div>
                 </div>
               </div>
 
               <div style="background: rgba(255,255,255,0.03); padding: 0.85rem 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
                 <div style="display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.4rem;">
                   <span style="color: var(--text-muted);">🧲 Potencial CTR</span>
-                  <strong style="color: #f59e0b;">{{ activeVideo.ctr_score || 94 }}/100</strong>
+                  <strong style="color: #f59e0b;">{{ activeVideo.ctr_score ?? 92 }}/100</strong>
                 </div>
                 <div style="width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden;">
-                  <div :style="{ width: (activeVideo.ctr_score || 94) + '%' }" style="height: 100%; background: #f59e0b;"></div>
+                  <div :style="{ width: (activeVideo.ctr_score ?? 92) + '%' }" style="height: 100%; background: #f59e0b;"></div>
                 </div>
               </div>
 
               <div style="background: rgba(255,255,255,0.03); padding: 0.85rem 1rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.05);">
                 <div style="display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.4rem;">
                   <span style="color: var(--text-muted);">🛡️ Monetização / Anti-Slop</span>
-                  <strong style="color: var(--success);">{{ activeVideo.originality_score || 98 }}/100</strong>
+                  <strong style="color: var(--success);">{{ activeVideo.originality_score ?? 95 }}/100</strong>
                 </div>
                 <div style="width: 100%; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden;">
-                  <div :style="{ width: (activeVideo.originality_score || 98) + '%' }" style="height: 100%; background: var(--success);"></div>
+                  <div :style="{ width: (activeVideo.originality_score ?? 95) + '%' }" style="height: 100%; background: var(--success);"></div>
                 </div>
               </div>
             </div>
@@ -1642,6 +1896,13 @@ const getStatusBadgeClass = (status) => {
           </div>
 
           <!-- Render Progress Bar: real, step-based progress reported by the server (renders run entirely server-side) -->
+          <div v-if="activeVideo.status === 'posting'" class="card" style="margin-bottom: 2rem; padding: 1.25rem 1.5rem;">
+            <span style="font-weight: 700; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
+              <span class="spinner"></span> Publicando no YouTube/TikTok...
+            </span>
+            <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.6rem;">O envio de vídeos longos pode levar vários minutos.</p>
+          </div>
+
           <div v-if="activeVideo.status === 'generating'" class="card" style="margin-bottom: 2rem; padding: 1.25rem 1.5rem;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
               <span style="font-weight: 700; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
@@ -1657,35 +1918,48 @@ const getStatusBadgeClass = (status) => {
             </p>
           </div>
 
-          <div class="grid-cols-3" style="align-items: flex-start;">
+          <div class="video-detail-grid">
             <!-- Left Side: Script and Metadata details -->
-            <div class="card" style="grid-column: span 2; display: flex; flex-direction: column; gap: 1.5rem;">
+            <div class="card" style="display: flex; flex-direction: column; gap: 1.5rem;">
               <div>
                 <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: 0.75rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Metadados Gerados por IA</h3>
                 <div class="form-group">
                   <label class="form-label">Título do Vídeo</label>
-                  <input v-model="activeVideo.title" type="text" class="form-input" />
+                  <input :value="activeVideo.title" readonly type="text" class="form-input" />
                 </div>
                 <div class="form-group">
                   <label class="form-label">Descrição SEO</label>
-                  <textarea v-model="activeVideo.description" rows="4" class="form-textarea"></textarea>
+                  <textarea :value="activeVideo.description" readonly rows="4" class="form-textarea"></textarea>
                 </div>
                 <div class="form-group">
                   <label class="form-label">Tags (separadas por vírgula)</label>
-                  <input v-model="activeVideo.tags" type="text" class="form-input" />
+                  <input :value="activeVideo.tags" readonly type="text" class="form-input" />
                 </div>
               </div>
 
               <div>
                 <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: 0.75rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Roteiro Integro</h3>
                 <p style="font-size: 0.95rem; color: var(--text-secondary); line-height: 1.6; white-space: pre-line; background: var(--bg-tertiary); padding: 1.25rem; border-radius: 12px; border: 1px solid var(--border-color);">
-                  {{ activeVideo.script }}
+                  {{ activeVideo.script || 'Nenhum roteiro gerado ainda.' }}
                 </p>
               </div>
             </div>
 
             <!-- Right Side: Scheduling and Video player preview -->
             <div style="display: flex; flex-direction: column; gap: 1.5rem;">
+              <!-- Video Player Preview Card -->
+              <div v-if="(activeVideo.video_path || activeVideo.shorts_path) && !activeVideo.media_purged" class="card">
+                <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: 1rem; color: var(--accent-cyan);">Prévia do Vídeo</h3>
+                <div v-if="activeVideo.video_path" style="margin-bottom: 1rem;">
+                  <span style="font-size: 0.75rem; color: var(--text-muted); display: block; margin-bottom: 0.4rem;">Formato 16:9</span>
+                  <video :src="formatRelativePath(activeVideo.video_path)" controls style="width: 100%; border-radius: 12px; background: #000; border: 1px solid var(--border-color);"></video>
+                </div>
+                <div v-if="activeVideo.shorts_path">
+                  <span style="font-size: 0.75rem; color: var(--text-muted); display: block; margin-bottom: 0.4rem;">Shorts 9:16</span>
+                  <video :src="formatRelativePath(activeVideo.shorts_path)" controls style="width: 100%; max-height: 360px; border-radius: 12px; background: #000; border: 1px solid var(--border-color);"></video>
+                </div>
+              </div>
+
               <!-- Scheduler Card -->
               <div v-if="activeVideo.status === 'ready' || activeVideo.status === 'scheduled'" class="card" style="border-color: rgba(6, 182, 212, 0.2);">
                 <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: 1rem; color: var(--accent-cyan);">Agendar Publicação</h3>
@@ -1694,13 +1968,19 @@ const getStatusBadgeClass = (status) => {
                   <label class="form-label">Data e Hora de Postagem</label>
                   <input v-model="scheduleDate" type="datetime-local" class="form-input" />
                 </div>
-                <button @click="scheduleVideo" class="btn btn-cyan" style="width: 100%;">
+                <p v-if="activeChannel && !activeChannel.yt_connected && !activeChannel.tiktok_connected" style="font-size: 0.78rem; color: var(--warning); margin-bottom: 0.75rem;">
+                  Conecte o YouTube ou o TikTok na página do canal para poder agendar.
+                </p>
+                <button @click="scheduleVideo" :disabled="!scheduleDate" class="btn btn-cyan" style="width: 100%;">
                   {{ activeVideo.status === 'scheduled' ? 'Atualizar Agendamento' : 'Agendar Postagem' }}
+                </button>
+                <button v-if="activeVideo.status === 'scheduled'" @click="unscheduleVideo" class="btn btn-secondary" style="width: 100%; margin-top: 0.5rem;">
+                  Cancelar Agendamento
                 </button>
               </div>
 
-              <div class="card">
-                <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: 1rem;">Estrutura de Cenas</h3>
+              <div v-if="activeVideo.scenes && activeVideo.scenes.length" class="card">
+                <h3 style="font-size: 1.1rem; font-weight: 700; margin-bottom: 1rem;">Estrutura de Cenas ({{ activeVideo.scenes.length }})</h3>
                 
                 <div style="display: flex; flex-direction: column; gap: 1rem;">
                   <div v-for="scene in activeVideo.scenes" :key="scene.id" style="border: 1px solid var(--border-color); border-radius: 12px; padding: 1rem; background: var(--bg-tertiary);">
@@ -1737,7 +2017,13 @@ const getStatusBadgeClass = (status) => {
 
         <div class="card" style="padding: 2rem;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-            <h3 style="font-size: 1.3rem; font-weight: 800; color: var(--accent-purple);">{{ getMonthName() }}</h3>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <button type="button" class="btn btn-secondary" style="padding: 0.4rem 0.75rem;" @click="shiftCalendarMonth(-1)" title="Mês anterior">‹</button>
+              <h3 style="font-size: 1.3rem; font-weight: 800; color: var(--accent-purple); min-width: 190px; text-align: center;">{{ getMonthName() }}</h3>
+              <button type="button" class="btn btn-secondary" style="padding: 0.4rem 0.75rem;" @click="shiftCalendarMonth(1)" title="Próximo mês">›</button>
+              <button type="button" class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" @click="goToCalendarToday">Hoje</button>
+              <span v-if="isLoadingCalendar" class="spinner" style="width: 14px; height: 14px;"></span>
+            </div>
             <div style="display: flex; gap: 1rem; font-size: 0.8rem;">
               <span style="display: flex; align-items: center; gap: 0.25rem;"><span class="badge badge-scheduled" style="width: 10px; height: 10px; padding:0; border-radius:50%;"></span> Agendados</span>
               <span style="display: flex; align-items: center; gap: 0.25rem;"><span class="badge badge-posted" style="width: 10px; height: 10px; padding:0; border-radius:50%;"></span> Publicados</span>
@@ -1759,8 +2045,10 @@ const getStatusBadgeClass = (status) => {
               <div v-if="day.dayNum !== null" style="display: flex; flex-direction: column; height: 100%;">
                 <span class="calendar-day-num">{{ day.dayNum }}</span>
                 <div style="flex-grow: 1; overflow-y: auto;">
-                  <div v-for="post in day.posts" :key="post.id" class="calendar-post-badge" :class="post.status === 'posted' ? 'badge-posted' : 'badge-scheduled'" :title="post.title">
-                    [{{ post.channelName }}] {{ post.title }}
+                  <div v-for="post in day.posts" :key="post.id" class="calendar-post-badge" :class="post.status === 'posted' ? 'badge-posted' : 'badge-scheduled'"
+                       :title="`${post.title} - ${statusLabel(post.status)} ${calendarPostDate(post).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`"
+                       style="cursor: pointer;" @click="openCalendarPost(post)">
+                    {{ calendarPostDate(post).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }} [{{ post.channel_name }}] {{ post.title }}
                   </div>
                 </div>
               </div>
@@ -1779,7 +2067,13 @@ const getStatusBadgeClass = (status) => {
         <div class="card" style="max-width: 700px; display: flex; flex-direction: column; gap: 2rem;">
           <div>
             <h3 style="font-weight: 700; margin-bottom: 1rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Inteligência Artificial (Criação)</h3>
-            <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">Forneça chaves da OpenAI ou Google Gemini. Se vazias, o sistema utilizará simulações mockadas de teste.</p>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.75rem;">Pelo menos uma chave de LLM (Groq, Google Gemini, Claude ou OpenAI) deve estar configurada para gerar roteiros e vídeos. Groq e Claude são configurados via <code>.env</code> no servidor e testáveis abaixo em Diagnóstico de Conexões.</p>
+            <p style="font-size: 0.8rem; margin-bottom: 1.25rem; display: flex; flex-wrap: wrap; gap: 0.75rem;">
+              <span :style="{ color: settingsStatus.groq_configured ? 'var(--success)' : 'var(--text-muted)' }">{{ settingsStatus.groq_configured ? '✓' : '✗' }} Groq</span>
+              <span :style="{ color: settingsStatus.gemini_configured ? 'var(--success)' : 'var(--text-muted)' }">{{ settingsStatus.gemini_configured ? '✓' : '✗' }} Gemini</span>
+              <span :style="{ color: settingsStatus.claude_configured ? 'var(--success)' : 'var(--text-muted)' }">{{ settingsStatus.claude_configured ? '✓' : '✗' }} Claude</span>
+              <span :style="{ color: settingsStatus.openai_configured ? 'var(--success)' : 'var(--text-muted)' }">{{ settingsStatus.openai_configured ? '✓' : '✗' }} OpenAI</span>
+            </p>
 
             <div class="form-group">
               <label class="form-label">Google Gemini API Key <span v-if="settingsStatus.gemini_configured" style="color: var(--success);">(configurada)</span></label>
@@ -1794,7 +2088,7 @@ const getStatusBadgeClass = (status) => {
             </div>
 
             <div class="form-group">
-              <label class="form-label">OpenAI API Key (para DALL-E e GPT) <span v-if="settingsStatus.openai_configured" style="color: var(--success);">(configurada)</span></label>
+              <label class="form-label">OpenAI API Key (logos, capas e thumbnails via gpt-image; GPT como último recurso de texto) <span v-if="settingsStatus.openai_configured" style="color: var(--success);">(configurada)</span></label>
               <div style="display: flex; gap: 0.5rem; align-items: center;">
                 <input v-model="settingsForm.openai_api_key" type="password" placeholder="sk-..." class="form-input" style="flex: 1;" />
                 <button type="button" class="btn btn-secondary" :disabled="apiTestResults.openai.loading" @click="testProvider('openai')" style="white-space: nowrap;">
@@ -1823,7 +2117,10 @@ const getStatusBadgeClass = (status) => {
 
           <div>
             <h3 style="font-weight: 700; margin-bottom: 1rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Integrações de Postagem</h3>
-            <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">Defina os IDs de aplicativos de desenvolvedor para permitir o login OAuth2 no YouTube e TikTok.</p>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Defina os IDs de aplicativos de desenvolvedor para permitir o login OAuth2 no YouTube e TikTok.</p>
+            <p v-if="settingsStatus.redirect_uri" style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1.25rem; word-break: break-all;">
+              URL de retorno (cadastre-a no Google Cloud / TikTok for Developers): <code>{{ settingsStatus.redirect_uri }}</code>
+            </p>
 
             <div class="grid-cols-2">
               <div class="form-group">
@@ -1871,6 +2168,32 @@ const getStatusBadgeClass = (status) => {
         </div>
 
         <div class="card" style="max-width: 700px; margin-top: 1.5rem;">
+          <h3 style="font-weight: 700; margin-bottom: 1rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Alterar Senha</h3>
+          <form @submit.prevent="changePassword" style="display: flex; flex-direction: column; gap: 0.25rem;">
+            <div class="form-group">
+              <label class="form-label">Senha atual</label>
+              <input v-model="passwordForm.current" type="password" autocomplete="current-password" required class="form-input" />
+            </div>
+            <div class="grid-cols-2">
+              <div class="form-group">
+                <label class="form-label">Nova senha (mín. 8 caracteres)</label>
+                <input v-model="passwordForm.next" type="password" autocomplete="new-password" required minlength="8" class="form-input" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Confirmar nova senha</label>
+                <input v-model="passwordForm.confirm" type="password" autocomplete="new-password" required minlength="8" class="form-input" />
+              </div>
+            </div>
+            <div style="display: flex; justify-content: flex-end;">
+              <button type="submit" :disabled="isChangingPassword" class="btn btn-primary">
+                <span v-if="isChangingPassword" class="spinner"></span>
+                <span v-else>Alterar Senha</span>
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <div class="card" style="max-width: 700px; margin-top: 1.5rem;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
             <h3 style="font-weight: 700;">Diagnóstico de Conexões</h3>
             <button type="button" class="btn btn-secondary" @click="testAllProviders">Testar Todas</button>
@@ -1880,9 +2203,9 @@ const getStatusBadgeClass = (status) => {
           </p>
           <div style="display: flex; flex-direction: column; gap: 0.75rem;">
             <div v-for="p in apiProviders.filter(p => ['groq','claude','pexels','pollinations','shotstack','r2','image_ranker'].includes(p.key))" :key="p.key"
-                 style="display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color);">
-              <span style="flex: 1; font-weight: 600;">{{ p.label }}</span>
-              <span v-if="apiTestResults[p.key].message" style="font-size: 0.8rem; max-width: 380px; text-align: right;"
+                 style="display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color);">
+              <span style="flex: 1; min-width: 180px; font-weight: 600;">{{ p.label }}</span>
+              <span v-if="apiTestResults[p.key].message" style="font-size: 0.8rem; max-width: 380px; text-align: right; word-break: break-word;"
                     :style="{ color: apiTestResults[p.key].ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults[p.key].message }}</span>
               <button type="button" class="btn btn-secondary" :disabled="apiTestResults[p.key].loading" @click="testProvider(p.key)" style="white-space: nowrap;">
                 <span v-if="apiTestResults[p.key].loading" class="spinner"></span>
@@ -1895,7 +2218,7 @@ const getStatusBadgeClass = (status) => {
     </main>
 
     <!-- Modal: Conception of Channel by AI -->
-    <div v-if="showCreateChannelModal" class="modal-backdrop">
+    <div v-if="showCreateChannelModal" class="modal-backdrop" @click.self="!isGeneratingChannel && (showCreateChannelModal = false)">
       <div class="modal-content">
         <h2 style="font-weight: 800; font-size: 1.5rem; margin-bottom: 0.5rem;">Conceber Canal com IA</h2>
         <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 1.5rem;">Insira o nicho que você deseja focar e a Inteligência Artificial gerará o nome, o conceito conceitual, o logotipo e o banner do zero.</p>

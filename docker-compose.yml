@@ -1,16 +1,24 @@
 services:
   postgres:
+    # Stays on 16: a major-version bump needs a dump/restore of the volume.
     image: postgres:16-alpine
     container_name: makinadark-db
     restart: always
     environment:
-      POSTGRES_USER: makina
-      POSTGRES_PASSWORD: makinadark
-      POSTGRES_DB: makinadark
+      POSTGRES_USER: ${POSTGRES_USER:-makina}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-makinadark}
+      POSTGRES_DB: ${POSTGRES_DB:-makinadark}
+    # Bound to localhost only - it used to be published on 0.0.0.0:5432 with
+    # a well-known password, i.e. open to the internet on any VPS.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   image-ranker:
     build:
@@ -22,6 +30,12 @@ services:
     # internal compose network (http://image-ranker:8500).
     expose:
       - "8500"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8500/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
 
   backend:
     build:
@@ -30,46 +44,48 @@ services:
     container_name: makinadark-backend
     restart: always
     ports:
-      - "8081:8080"
-    # Secrets are NOT baked into this file or the image - they're substituted
-    # from the environment docker-compose itself runs in. Locally, run:
-    #   docker compose --env-file backend/.env up -d --build
-    # (backend/.env already has every key below, gitignored, never committed).
-    # On EasyPanel, paste the same key=value pairs into the Compose service's
-    # "Environment" tab - EasyPanel writes them to its own .env next to this
-    # file before running compose, so the exact same substitution applies.
+      - "127.0.0.1:8081:8080"
+    # API keys / OAuth secrets come from env files, never from this file or
+    # the image:
+    #   - backend/.env   local development (gitignored)
+    #   - .env           next to this file: what EasyPanel writes from its
+    #                    "Environment" tab
+    # Both are optional and loaded straight into the container. The previous
+    # setup only substituted ${VAR}s from a root .env, so a plain
+    # `docker compose up` started the backend with EVERY key empty
+    # ("nenhuma chave de API de LLM configurada") unless you remembered
+    # --env-file backend/.env.
+    env_file:
+      - path: ./backend/.env
+        required: false
+      - path: ./.env
+        required: false
+    # Wiring that must always point at the services in this file (these win
+    # over anything in the env files).
     environment:
-      - PORT=8080
-      - POSTGRES_HOST=postgres
-      - POSTGRES_USER=makina
-      - POSTGRES_PASSWORD=makinadark
-      - POSTGRES_DB=makinadark
-      - IMAGE_RANKER_URL=http://image-ranker:8500
-      - JWT_SECRET=${JWT_SECRET}
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
-      - POLLINATIONS_API_KEY=${POLLINATIONS_API_KEY}
-      - PEXELS_API_KEY=${PEXELS_API_KEY}
-      - SHOTSTACK_API_KEY=${SHOTSTACK_API_KEY}
-      - YOUTUBE_CLIENT_ID=${YOUTUBE_CLIENT_ID}
-      - YOUTUBE_CLIENT_SECRET=${YOUTUBE_CLIENT_SECRET}
-      - TIKTOK_CLIENT_ID=${TIKTOK_CLIENT_ID}
-      - TIKTOK_CLIENT_SECRET=${TIKTOK_CLIENT_SECRET}
-      - REDIRECT_URI=${REDIRECT_URI}
-      - USER_PHONE_NUMBER=${USER_PHONE_NUMBER}
-      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
-      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
-      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
-      - R2_BUCKET=${R2_BUCKET}
-      - R2_PUBLIC_BASE_URL=${R2_PUBLIC_BASE_URL}
+      PORT: "8080"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-makina}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-makinadark}
+      POSTGRES_DB: ${POSTGRES_DB:-makinadark}
+      IMAGE_RANKER_URL: http://image-ranker:8500
+      # Auto-pilot "preferred post hour" and daily quotas are wall-clock
+      # times - without TZ the container runs on UTC (18:00 UTC = 15:00 BRT).
+      TZ: ${TZ:-America/Sao_Paulo}
     volumes:
       - backend_media:/app/media
     depends_on:
-      - postgres
-      - image-ranker
+      postgres:
+        condition: service_healthy
+      image-ranker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   frontend:
     build:
@@ -78,9 +94,10 @@ services:
     container_name: makinadark-frontend
     restart: always
     ports:
-      - "3000:80"
+      - "${FRONTEND_PORT:-3000}:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:

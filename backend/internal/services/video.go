@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"makinadark/backend/internal/config"
 	"makinadark/backend/internal/db"
 	"makinadark/backend/internal/models"
 )
@@ -65,6 +66,11 @@ func CompileVideo(videoID string) {
 	db.DB.Save(&video)
 
 	log.Printf("Starting video rendering for ID: %s", video.ID)
+
+	if len(video.Scenes) == 0 {
+		failVideo(&video, "Nenhuma cena para renderizar - gere o roteiro novamente.")
+		return
+	}
 
 	// Rendering runs entirely on this server (FFmpeg in the backend container),
 	// never in the browser - totalSteps is scenes + concat + mix/subtitles + shorts.
@@ -143,8 +149,8 @@ func CompileVideo(videoID string) {
 		workers = 1
 	}
 
-	var dbMu sync.Mutex   // serialize DB writes/progress updates across workers
-	var doneCount int     // guarded by dbMu
+	var dbMu sync.Mutex // serialize DB writes/progress updates across workers
+	var doneCount int   // guarded by dbMu
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 
@@ -416,6 +422,15 @@ func CompileVideo(videoID string) {
 		shortsVideoFilter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
 	}
 
+	// The 9:16 cut is what goes to TikTok, so it's capped to short-form
+	// length (SHORTS_MAX_SECONDS, default 60s - the hook-first opening of
+	// the script). It used to be the ENTIRE 20-30 minute video cropped
+	// vertically, which is neither a "Short" nor something TikTok accepts.
+	var shortsDurationArgs []string
+	if max := config.AppConfig.ShortsMaxSeconds; max > 0 {
+		shortsDurationArgs = []string{"-t", fmt.Sprintf("%d", max)}
+	}
+
 	// Procedural noise source with lower background noise amplitude (0.25)
 	noiseSource := fmt.Sprintf("anoisesrc=color=%s:sample_rate=44100:amplitude=0.25", noiseColor)
 	// Reduced background music volume (musicMixLevel * 0.35) and boosted narrator voice ([0:a]volume=1.45)
@@ -438,26 +453,32 @@ func CompileVideo(videoID string) {
 		"-ar", "44100",
 		"-ac", "2",
 		"-vf", subFilter,
+		"-movflags", "+faststart", // moov atom first: the browser preview can start playing before the whole file downloads
 		finalLongPath,
 	)
-	shortsCmd := exec.Command("ffmpeg", "-y",
+	shortsArgs := []string{"-y",
 		"-i", rawMergedPath,
 		"-f", "lavfi", "-i", noiseSource,
 		"-filter_complex", fmt.Sprintf("[0:v]%s[vout];[0:a]volume=1.45[a0];[1:a]volume=%f[a1];[a0][a1]amix=inputs=2:duration=first[aout]", shortsVideoFilter, bgMusicVolume),
 		"-map", "[vout]",
 		"-map", "[aout]",
+	}
+	shortsArgs = append(shortsArgs, shortsDurationArgs...)
+	shortsArgs = append(shortsArgs,
 		"-c:v", "libx264",
-		"-crf", "18",
+		"-crf", "20",
 		"-preset", "fast",
-		"-b:v", "12M",
-		"-maxrate", "16M",
-		"-bufsize", "24M",
+		"-b:v", "8M",
+		"-maxrate", "10M",
+		"-bufsize", "16M",
 		"-c:a", "aac",
 		"-b:a", "192k",
 		"-ar", "44100",
 		"-ac", "2",
+		"-movflags", "+faststart",
 		finalShortPath,
 	)
+	shortsCmd := exec.Command("ffmpeg", shortsArgs...)
 
 	var mixOut, shortsOut []byte
 	var mixErr, shortsErr error
