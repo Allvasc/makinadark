@@ -37,7 +37,7 @@ Vídeos já criados anteriormente neste canal: %v
 REGRA OBRIGATÓRIA: Escolha um assunto inédito que NUNCA foi abordado nos vídeos anteriores listados acima para evitar repetição. Retorne apenas o assunto em texto simples.`,
 			channel.Niche, trendsStr, existingTitles)
 
-		newTopic, err := CallLLM(channel.ID, videoID, prompt)
+		newTopic, err := CallLLMText(channel.ID, videoID, prompt)
 		if err == nil && newTopic != "" {
 			topic = strings.TrimSpace(newTopic)
 		} else if len(liveTrends) > 0 {

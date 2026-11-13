@@ -850,6 +850,7 @@ const settingsStatus = reactive({
   openai_configured: false,
   gemini_configured: false,
   elevenlabs_configured: false,
+  pexels_configured: false,
   youtube_configured: false,
   tiktok_configured: false,
   groq_configured: false,
@@ -892,6 +893,7 @@ const settingsForm = reactive({
   openai_api_key: '',
   gemini_api_key: '',
   elevenlabs_api_key: '',
+  pexels_api_key: '',
   youtube_client_id: '',
   youtube_client_secret: '',
   tiktok_client_id: '',
@@ -2116,6 +2118,21 @@ const canRender = (video) => video && (video.status === 'draft' || video.status 
           </div>
 
           <div>
+            <h3 style="font-weight: 700; margin-bottom: 1rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Mídia Stock (Cenas)</h3>
+            <div class="form-group">
+              <label class="form-label">Pexels API Key (Fotos e Clipes HD) <span v-if="settingsStatus.pexels_configured" style="color: var(--success);">(configurada)</span></label>
+              <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <input v-model="settingsForm.pexels_api_key" type="password" placeholder="Entrar Pexels Key..." class="form-input" style="flex: 1;" />
+                <button type="button" class="btn btn-secondary" :disabled="apiTestResults.pexels.loading" @click="testProvider('pexels')" style="white-space: nowrap;">
+                  <span v-if="apiTestResults.pexels.loading" class="spinner"></span>
+                  <span v-else>Testar</span>
+                </button>
+              </div>
+              <p v-if="apiTestResults.pexels.message" style="font-size: 0.8rem; margin-top: 0.35rem;" :style="{ color: apiTestResults.pexels.ok ? 'var(--success)' : 'var(--danger)' }">{{ apiTestResults.pexels.message }}</p>
+            </div>
+          </div>
+
+          <div>
             <h3 style="font-weight: 700; margin-bottom: 1rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">Integrações de Postagem</h3>
             <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Defina os IDs de aplicativos de desenvolvedor para permitir o login OAuth2 no YouTube e TikTok.</p>
             <p v-if="settingsStatus.redirect_uri" style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1.25rem; word-break: break-all;">
@@ -2202,7 +2219,7 @@ const canRender = (video) => video && (video.status === 'draft' || video.status 
             Demais integrações (configuradas via variável de ambiente no servidor, não editáveis aqui). Cada botão faz uma chamada real e mínima à API e mostra o motivo exato em caso de erro.
           </p>
           <div style="display: flex; flex-direction: column; gap: 0.75rem;">
-            <div v-for="p in apiProviders.filter(p => ['groq','claude','pexels','pollinations','shotstack','r2','image_ranker'].includes(p.key))" :key="p.key"
+            <div v-for="p in apiProviders.filter(p => ['groq','claude','pollinations','shotstack','r2','image_ranker'].includes(p.key))" :key="p.key"
                  style="display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color);">
               <span style="flex: 1; min-width: 180px; font-weight: 600;">{{ p.label }}</span>
               <span v-if="apiTestResults[p.key].message" style="font-size: 0.8rem; max-width: 380px; text-align: right; word-break: break-word;"

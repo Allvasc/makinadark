@@ -1316,6 +1316,7 @@ type UpdateSettingsInput struct {
 	OpenAIAPIKey     string `json:"openai_api_key"`
 	GeminiAPIKey     string `json:"gemini_api_key"`
 	ElevenLabsAPIKey string `json:"elevenlabs_api_key"`
+	PexelsAPIKey     string `json:"pexels_api_key"`
 	YouTubeClientID  string `json:"youtube_client_id"`
 	YouTubeClientSec string `json:"youtube_client_secret"`
 	TikTokClientID   string `json:"tiktok_client_id"`
@@ -1340,6 +1341,7 @@ func UpdateSettings(c *fiber.Ctx) error {
 	set(&s.OpenAIAPIKey, input.OpenAIAPIKey)
 	set(&s.GeminiAPIKey, input.GeminiAPIKey)
 	set(&s.ElevenLabsAPIKey, input.ElevenLabsAPIKey)
+	set(&s.PexelsAPIKey, input.PexelsAPIKey)
 	set(&s.YouTubeClientID, input.YouTubeClientID)
 	set(&s.YouTubeClientSec, input.YouTubeClientSec)
 	set(&s.TikTokClientID, input.TikTokClientID)
@@ -1351,7 +1353,7 @@ func UpdateSettings(c *fiber.Ctx) error {
 	}
 
 	config.ApplySettingsOverride(s.OpenAIAPIKey, s.GeminiAPIKey, s.ElevenLabsAPIKey,
-		s.YouTubeClientID, s.YouTubeClientSec, s.TikTokClientID, s.TikTokClientSec)
+		s.PexelsAPIKey, s.YouTubeClientID, s.YouTubeClientSec, s.TikTokClientID, s.TikTokClientSec)
 
 	return c.JSON(fiber.Map{"status": "saved"})
 }

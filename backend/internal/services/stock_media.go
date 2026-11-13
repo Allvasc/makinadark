@@ -109,12 +109,7 @@ func AcquireSceneImage(channelID, videoID, prompt, category string) (string, err
 	if photoPath, err := FetchStockPhoto(channelID, videoID, prompt); err == nil && photoPath != "" {
 		return photoPath, nil
 	}
-	imgPath, err := GenerateImage(channelID, videoID, prompt, category)
-	if err == nil && imgPath != "" {
-		return imgPath, nil
-	}
-
-	return fetchFallbackStockPhoto(prompt, category)
+	return GenerateImage(channelID, videoID, prompt, category)
 }
 
 // AcquireSceneAsset picks the visual asset for one scene, alternating between
@@ -127,14 +122,14 @@ func AcquireSceneAsset(channelID, videoID, prompt, category string, index int) (
 			return "", clipURL
 		}
 	}
-	if imgPath, err := AcquireSceneImage(channelID, videoID, prompt, category); err == nil && imgPath != "" {
+	imgPath, err := AcquireSceneImage(channelID, videoID, prompt, category)
+	if err == nil && imgPath != "" {
 		return imgPath, ""
 	}
+	if err != nil {
+		log.Printf("Scene asset acquisition failed (%s): %v", category, err)
+	}
 	return "", ""
-}
-
-func fetchFallbackStockPhoto(prompt, category string) (string, error) {
-	return generatePollinationsImage(prompt, category)
 }
 
 type PexelsVideoResponse struct {

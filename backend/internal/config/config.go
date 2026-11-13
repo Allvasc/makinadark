@@ -166,7 +166,7 @@ func getEnvInt(key string, defaultValue int) int {
 // ApplySettingsOverride overlays non-empty values from DB-stored settings on
 // top of the env-derived config, without a restart. Empty strings are treated
 // as "no override" and leave the current value untouched.
-func ApplySettingsOverride(openAI, gemini, elevenLabs, ytClientID, ytClientSecret, ttClientID, ttClientSecret string) {
+func ApplySettingsOverride(openAI, gemini, elevenLabs, pexels, ytClientID, ytClientSecret, ttClientID, ttClientSecret string) {
 	if openAI != "" {
 		AppConfig.OpenAIAPIKey = openAI
 	}
@@ -175,6 +175,9 @@ func ApplySettingsOverride(openAI, gemini, elevenLabs, ytClientID, ytClientSecre
 	}
 	if elevenLabs != "" {
 		AppConfig.ElevenLabsAPIKey = elevenLabs
+	}
+	if pexels != "" {
+		AppConfig.PexelsAPIKey = pexels
 	}
 	if ytClientID != "" {
 		AppConfig.YouTubeClientID = ytClientID

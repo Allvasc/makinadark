@@ -95,7 +95,7 @@ REGRAS OBRIGATÓRIAS (FATOS REAIS E HISTÓRIAS CONCRETAS):
 
 Retorne estritamente os 3 tópicos separados por vírgula em texto simples, sem numeração.`, trendsText, niche, niche)
 
-	resultStr, err := CallLLM(channelID, "", prompt)
+	resultStr, err := CallLLMText(channelID, "", prompt)
 	if err != nil {
 		return fetchAITrendingTopics(channelID, niche)
 	}
@@ -121,7 +121,7 @@ func fetchAITrendingTopics(channelID, niche string) ([]string, error) {
 REGRA ABSOLUTA: Os tópicos DEVEM ser focados em HISTÓRIAS REAIS E FATOS CONCRETOS. É proibido gerar temas filosóficos, abstratos ou existenciais.
 Retorne os 3 tópicos separados por vírgula em texto simples, sem numeração.`, niche)
 
-	resultStr, err := CallLLM(channelID, "", prompt)
+	resultStr, err := CallLLMText(channelID, "", prompt)
 	if err != nil {
 		return []string{
 			fmt.Sprintf("A História Real Por Trás dos Maiores Casos de %s", niche),

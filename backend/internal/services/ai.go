@@ -127,10 +127,25 @@ type ClaudeResponse struct {
 	} `json:"usage"`
 }
 
+// llmHTTPTimeout covers full non-streaming script generation (35-55 scenes,
+// ~3000-4500 words) across every LLM provider so slow responses don't get cut off
+// while awaiting headers.
+const llmHTTPTimeout = 5 * time.Minute
+
 // CallLLM sends a prompt to Groq, Gemini, Claude, or OpenAI, requesting a JSON response.
 // channelID/videoID attribute the call's cost to the cost dashboard - videoID
 // may be empty for channel-level calls (branding, trends) not tied to one video.
 func CallLLM(channelID, videoID, prompt string) (string, error) {
+	return callLLM(channelID, videoID, prompt, true)
+}
+
+// CallLLMText sends a prompt to the configured LLM chain without forcing JSON
+// output mode, for callers that expect plain text (e.g. topic selection).
+func CallLLMText(channelID, videoID, prompt string) (string, error) {
+	return callLLM(channelID, videoID, prompt, false)
+}
+
+func callLLM(channelID, videoID, prompt string, jsonMode bool) (string, error) {
 	groqKey := config.AppConfig.GroqAPIKey
 	groqConfigured := config.IsSet(groqKey)
 
@@ -154,7 +169,7 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 	var failures []string
 
 	if groqConfigured {
-		result, err := callGroq(channelID, videoID, prompt, groqKey)
+		result, err := callGroq(channelID, videoID, prompt, groqKey, jsonMode)
 		if err == nil {
 			return result, nil
 		}
@@ -163,7 +178,7 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 	}
 
 	if geminiConfigured {
-		result, err := callGemini(channelID, videoID, prompt, geminiKey)
+		result, err := callGemini(channelID, videoID, prompt, geminiKey, jsonMode)
 		if err == nil {
 			return result, nil
 		}
@@ -172,7 +187,7 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 	}
 
 	if claudeConfigured {
-		result, err := callClaude(channelID, videoID, prompt, claudeKey)
+		result, err := callClaude(channelID, videoID, prompt, claudeKey, jsonMode)
 		if err == nil {
 			return result, nil
 		}
@@ -181,7 +196,7 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 	}
 
 	if openAIConfigured {
-		result, err := callOpenAI(channelID, videoID, prompt, openAIKey)
+		result, err := callOpenAI(channelID, videoID, prompt, openAIKey, jsonMode)
 		if err == nil {
 			return result, nil
 		}
@@ -198,16 +213,26 @@ func CallLLM(channelID, videoID, prompt string) (string, error) {
 	return "", fmt.Errorf("todos os provedores de LLM falharam - %s", strings.Join(failures, " | "))
 }
 
-func callGroq(channelID, videoID, prompt string, apiKey string) (string, error) {
-	url := "https://api.groq.com/openai/v1/chat/completions"
-
-	reqPayload := OpenAIRequest{
-		Model: "llama-3.3-70b-versatile",
-		Messages: []OpenAIMessage{
-			{Role: "user", Content: prompt},
-		},
-		ResponseFormat: &OpenAIFormat{Type: "json_object"},
+func buildOpenAIChatRequest(model, prompt string, jsonMode bool) OpenAIRequest {
+	messages := []OpenAIMessage{{Role: "user", Content: prompt}}
+	var respFmt *OpenAIFormat
+	if jsonMode {
+		respFmt = &OpenAIFormat{Type: "json_object"}
+		// OpenAI rejects response_format=json_object with HTTP 400 unless
+		// "json" appears somewhere in messages.
+		if !strings.Contains(strings.ToLower(prompt), "json") {
+			messages = append([]OpenAIMessage{{Role: "system", Content: "Respond with valid JSON."}}, messages...)
+		}
 	}
+	return OpenAIRequest{
+		Model:          model,
+		Messages:       messages,
+		ResponseFormat: respFmt,
+	}
+}
+
+func callOpenAICompatible(providerName, url, model, apiKey, prompt string, jsonMode bool, timeout time.Duration, recordUsage func(promptTokens, completionTokens int)) (string, error) {
+	reqPayload := buildOpenAIChatRequest(model, prompt, jsonMode)
 
 	body, err := json.Marshal(reqPayload)
 	if err != nil {
@@ -221,7 +246,7 @@ func callGroq(channelID, videoID, prompt string, apiKey string) (string, error) 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -234,25 +259,45 @@ func callGroq(channelID, videoID, prompt string, apiKey string) (string, error) 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("groq api returned status %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("%s api returned status %d: %s", providerName, resp.StatusCode, string(respBody))
 	}
 
-	var groqResp OpenAIResponse
-	if err := json.Unmarshal(respBody, &groqResp); err != nil {
+	var parsed OpenAIResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return "", err
 	}
 
-	if len(groqResp.Choices) == 0 {
-		return "", fmt.Errorf("groq api returned empty choices")
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("%s api returned empty choices", providerName)
 	}
 
-	RecordGroqTokens(channelID, videoID, groqResp.Usage.PromptTokens, groqResp.Usage.CompletionTokens)
+	if recordUsage != nil {
+		recordUsage(parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens)
+	}
 
-	return groqResp.Choices[0].Message.Content, nil
+	return parsed.Choices[0].Message.Content, nil
 }
 
-func callClaude(channelID, videoID, prompt string, apiKey string) (string, error) {
+func callGroq(channelID, videoID, prompt string, apiKey string, jsonMode bool) (string, error) {
+	return callOpenAICompatible(
+		"groq",
+		"https://api.groq.com/openai/v1/chat/completions",
+		"llama-3.3-70b-versatile",
+		apiKey,
+		prompt,
+		jsonMode,
+		llmHTTPTimeout,
+		func(pt, ct int) { RecordGroqTokens(channelID, videoID, pt, ct) },
+	)
+}
+
+func callClaude(channelID, videoID, prompt string, apiKey string, jsonMode bool) (string, error) {
 	url := "https://api.anthropic.com/v1/messages"
+
+	content := prompt
+	if jsonMode {
+		content += "\n\nIMPORTANTE: Retorne ESTRITAMENTE um objeto JSON válido."
+	}
 
 	reqPayload := ClaudeRequest{
 		// claude-3-5-sonnet-20241022 was retired on 2025-10-28 - every call
@@ -263,7 +308,7 @@ func callClaude(channelID, videoID, prompt string, apiKey string) (string, error
 		// headroom to avoid the JSON being cut off mid-object.
 		MaxTokens: 16000,
 		Messages: []ClaudeMessage{
-			{Role: "user", Content: prompt + "\n\nIMPORTANTE: Retorne ESTRITAMENTE um objeto JSON válido."},
+			{Role: "user", Content: content},
 		},
 		Fallbacks: "default",
 	}
@@ -282,7 +327,7 @@ func callClaude(channelID, videoID, prompt string, apiKey string) (string, error
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("anthropic-beta", "server-side-fallback-2026-07-01")
 
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := &http.Client{Timeout: llmHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -331,7 +376,7 @@ func callClaude(channelID, videoID, prompt string, apiKey string) (string, error
 // claude-3-5-sonnet this code was written against.
 const claudeModel = "claude-sonnet-5-5"
 
-func callGemini(channelID, videoID, prompt string, apiKey string) (string, error) {
+func callGemini(channelID, videoID, prompt string, apiKey string, jsonMode bool) (string, error) {
 	// "gemini-2.5-flash" was retired for new accounts (404 "no longer
 	// available to new users") - gemini-flash-latest tracks whatever Google
 	// currently points free-tier traffic at, so this doesn't need to be
@@ -346,9 +391,11 @@ func callGemini(channelID, videoID, prompt string, apiKey string) (string, error
 				},
 			},
 		},
-		GenerationConfig: &GeminiGenConfig{
+	}
+	if jsonMode {
+		reqPayload.GenerationConfig = &GeminiGenConfig{
 			ResponseMimeType: "application/json",
-		},
+		}
 	}
 
 	body, err := json.Marshal(reqPayload)
@@ -361,7 +408,8 @@ func callGemini(channelID, videoID, prompt string, apiKey string) (string, error
 	// published limits) is consumed even by calls that fail.
 	RecordGeminiRequest(channelID, videoID)
 
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	client := &http.Client{Timeout: llmHTTPTimeout}
+	resp, err := client.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		return "", err
 	}
@@ -388,57 +436,17 @@ func callGemini(channelID, videoID, prompt string, apiKey string) (string, error
 	return geminiResp.Candidates[0].Content.Parts[0].Text, nil
 }
 
-func callOpenAI(channelID, videoID, prompt string, apiKey string) (string, error) {
-	url := "https://api.openai.com/v1/chat/completions"
-
-	reqPayload := OpenAIRequest{
-		Model: "gpt-4o-mini",
-		Messages: []OpenAIMessage{
-			{Role: "user", Content: prompt},
-		},
-		ResponseFormat: &OpenAIFormat{Type: "json_object"},
-	}
-
-	body, err := json.Marshal(reqPayload)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("openai api returned status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var openAIResp OpenAIResponse
-	if err := json.Unmarshal(respBody, &openAIResp); err != nil {
-		return "", err
-	}
-
-	if len(openAIResp.Choices) == 0 {
-		return "", fmt.Errorf("openai api returned empty choices")
-	}
-
-	RecordOpenAITokens(channelID, videoID, openAIResp.Usage.PromptTokens, openAIResp.Usage.CompletionTokens)
-
-	return openAIResp.Choices[0].Message.Content, nil
+func callOpenAI(channelID, videoID, prompt string, apiKey string, jsonMode bool) (string, error) {
+	return callOpenAICompatible(
+		"openai",
+		"https://api.openai.com/v1/chat/completions",
+		"gpt-4o-mini",
+		apiKey,
+		prompt,
+		jsonMode,
+		llmHTTPTimeout,
+		func(pt, ct int) { RecordOpenAITokens(channelID, videoID, pt, ct) },
+	)
 }
 
 // GenerateBrandingResult matches the expected JSON structure from LLM
@@ -528,8 +536,24 @@ type VideoScriptResult struct {
 	Scenes           []SceneOutput `json:"scenes"`
 }
 
-func GenerateVideoScript(channelID, videoID, channelName, niche, topic string) (*VideoScriptResult, error) {
-	prompt := fmt.Sprintf(`Você é um roteirista e estrategista sênior especialista em canais Dark no YouTube (estratégia 2026 de alta retenção e monetização).
+func channelHasConfiguredOutro(channelID string) bool {
+	if db.DB == nil || strings.TrimSpace(channelID) == "" {
+		return false
+	}
+	var ch models.Channel
+	if err := db.DB.Select("outro_video_path", "outro_status").First(&ch, "id = ?", channelID).Error; err != nil {
+		return false
+	}
+	return strings.TrimSpace(ch.OutroVideoPath) != "" || ch.OutroStatus == "ready" || ch.OutroStatus == "generating"
+}
+
+func buildVideoScriptPrompt(channelName, niche, topic string, hasOutro bool) string {
+	closingRule := "- ÚLTIMA CENA (CALL TO ACTION NATURAL): chamada fluida para engajamento (comentário provocativo sobre a história real e inscrição)."
+	if hasOutro {
+		closingRule = "- ÚLTIMA CENA (DESFECHO FACTUAL — SEM CTA): este canal JÁ possui um vídeo de encerramento (outro) separado que será exibido logo após a última cena. Portanto, É ESTRITAMENTE PROIBIDO incluir despedida (\"até o próximo vídeo\", \"obrigado por assistir\") ou pedir para seguir, se inscrever, curtir, dar like, ativar o sininho ou comentar na última cena (ou em qualquer outra cena). Encerre o roteiro exclusivamente com o desfecho factual e o impacto final da história, evitando duplo encerramento."
+	}
+
+	return fmt.Sprintf(`Você é um roteirista e estrategista sênior especialista em canais Dark no YouTube (estratégia 2026 de alta retenção e monetização).
 Crie um ROTEIRO COMPLETO, PROFUNDO E IMPRESSIONANTE para o canal '%s' (Nicho: '%s') sobre o tema: '%s'.
 
 DIRETRIZES ESSENCIAIS DO ALGORITMO YOUTUBE 2026 (FATOS REAIS & ALTA RETENÇÃO):
@@ -543,7 +567,7 @@ DIRETRIZES ESSENCIAIS DO ALGORITMO YOUTUBE 2026 (FATOS REAIS & ALTA RETENÇÃO):
    - SE O TEMA ENVOLVER MAIS DE UM CASO/EVENTO/MISTÉRIO (ex: uma lista de mistérios ou casos): desenvolva cada caso A FUNDO seguindo, nesta ordem: (a) o contexto concreto do caso - data, local, nomes das pessoas envolvidas, números relevantes; (b) a explicação oficial/óbvia e especificamente por que ela não convence ou não fecha; (c) a investigação em si - o que foi encontrado, descartado, ou permanece sem resposta, com detalhes verídicos do processo; (d) pelo menos duas teorias concorrentes específicas, com quem as defende e o raciocínio por trás de cada uma; (e) o estado atual do caso e por que ele ainda fascina/assombra as pessoas.
    - QUANTOS CASOS ESCOLHER: isso depende de quantos fatos REAIS e DISTINTOS existem sobre o tema para preencher 35 a 55 cenas sem repetição. Se 3 casos não têm fatos suficientes para preencher o roteiro sem repetir o que já foi dito, ADICIONE MAIS CASOS em vez de esticar os mesmos 3 com cenas de recapitulação. NUNCA decida quantos casos usar antes de saber quanto material real cada um tem.
    - PENÚLTIMA CENA (CLÍMAX & REVELAÇÃO FACTUAL): a grande virada de chave ou desfecho marcante do caso mais forte do vídeo.
-   - ÚLTIMA CENA (CALL TO ACTION NATURAL): chamada fluida para engajamento (comentário provocativo sobre a história real e inscrição).
+   %s
 5. DURAÇÃO DE CADA CENA: 70 a 100 palavras de narração fluida, natural, expressiva e rica em detalhes reais.
 6. PROFUNDIDADE E ESPECIFICIDADE (PROIBIDO SUPERFICIALIDADE): é ESTRITAMENTE PROIBIDO apenas anunciar um fato e seguir adiante (ex: "as investigações não encontraram respostas conclusivas" sem dizer O QUE foi investigado, POR QUEM, e o que foi encontrado ou descartado no caminho). Toda cena de desenvolvimento deve trazer pelo menos um destes elementos concretos: uma data/número específico, um nome de pessoa/lugar/organização envolvida, um detalhe sensorial ou narrativo do momento do evento, uma declaração ou citação atribuída a alguém, ou uma teoria/especulação nomeada com sua justificativa. Escreva como um jornalista investigativo contando uma história: cada cena responde uma pergunta concreta e levanta a próxima - nunca resuma um fato inteiro numa única frase genérica e passe para o próximo assunto.
 7. PROIBIDO REPETIR OU RECAPITULAR (ANTI-ENCHIMENTO): é ESTRITAMENTE PROIBIDO reafirmar em outras palavras um fato que uma cena anterior já contou (ex: contar que Fulano foi excomungado por algo na cena 4 e depois "relembrar" o mesmo fato quase com as mesmas palavras nas cenas 16, 17, 18 e 19 - isso é enchimento, não é permitido). Cada cena precisa acrescentar uma informação NOVA que nenhuma cena anterior mencionou. NÃO escreva frases de preenchimento genéricas tipo "vamos explorar mais a fundo", "essa história é fascinante" ou "ainda há muito a descobrir" sem vir acompanhadas de um fato novo concreto na mesma cena. Se ao revisar o roteiro antes de responder você perceber que uma cena só repete o que já foi dito, SUBSTITUA essa cena por um fato novo e real sobre o tema, ou por um caso adicional (ver item 4).
@@ -572,7 +596,20 @@ Retorne estritamente em formato JSON com esta exata estrutura:
   ]
 }
 
-IMPORTANTE: o array "scenes" deve conter TODAS as 35 a 55 cenas do roteiro completo (não resuma nem interrompa antes do fim).`, channelName, niche, topic, niche)
+IMPORTANTE: o array "scenes" deve conter TODAS as 35 a 55 cenas do roteiro completo (não resuma nem interrompa antes do fim).`, channelName, niche, topic, closingRule, niche)
+}
+
+func scriptSupervisorRubric(hasOutro bool) string {
+	rubric := "O roteiro deve ser baseado em histórias/fatos REAIS (nunca filosofia ou ficção genérica), a Cena 1 deve ser um gancho direto sem saudações, o título deve ser magnético mas fiel ao conteúdo, e o roteiro deve ter pelo menos 25 cenas. CRÍTICO: as cenas de desenvolvimento (amostra em development_samples) NÃO podem ser superficiais - reprove se alguma delas apenas anunciar um fato genérico sem data, nome, número, detalhe narrativo ou teoria específica (ex: 'as investigações não encontraram respostas' sozinho, sem dizer o que foi investigado, é raso e deve ser reprovado)."
+	if hasOutro {
+		rubric += " CRÍTICO: este canal já possui um vídeo de encerramento separado - reprove se last_scene tiver despedida ('até o próximo vídeo', 'obrigado por assistir') ou pedir para o espectador seguir, se inscrever, curtir, dar like, ativar o sininho ou comentar."
+	}
+	return rubric
+}
+
+func GenerateVideoScript(channelID, videoID, channelName, niche, topic string) (*VideoScriptResult, error) {
+	hasOutro := channelHasConfiguredOutro(channelID)
+	prompt := buildVideoScriptPrompt(channelName, niche, topic, hasOutro)
 
 	// A single malformed/truncated response used to kill the whole video with
 	// no recourse - and the 35-55 scene / 3000-4500 word target makes
@@ -615,9 +652,9 @@ IMPORTANTE: o array "scenes" deve conter TODAS as 35 a 55 cenas do roteiro compl
 			}
 
 			verdict := runSupervisorCheck(channelID, videoID, "roteiro (Roteirista)",
-				"O roteiro deve ser baseado em histórias/fatos REAIS (nunca filosofia ou ficção genérica), a Cena 1 deve ser um gancho direto sem saudações, o título deve ser magnético mas fiel ao conteúdo, e o roteiro deve ter pelo menos 25 cenas. CRÍTICO: as cenas de desenvolvimento (amostra em development_samples) NÃO podem ser superficiais - reprove se alguma delas apenas anunciar um fato genérico sem data, nome, número, detalhe narrativo ou teoria específica (ex: 'as investigações não encontraram respostas' sozinho, sem dizer o que foi investigado, é raso e deve ser reprovado).",
-				fmt.Sprintf(`{"title":%q,"description":%q,"scene_count":%d,"scene_1":%q,"scene_2":%q,"development_samples":[%s]}`,
-					result.Title, result.Description, len(result.Scenes), result.Scenes[0].NarrationText, result.Scenes[1].NarrationText, strings.TrimSuffix(samples.String(), ",")))
+				scriptSupervisorRubric(hasOutro),
+				fmt.Sprintf(`{"title":%q,"description":%q,"scene_count":%d,"scene_1":%q,"scene_2":%q,"last_scene":%q,"development_samples":[%s]}`,
+					result.Title, result.Description, len(result.Scenes), result.Scenes[0].NarrationText, result.Scenes[1].NarrationText, result.Scenes[len(result.Scenes)-1].NarrationText, strings.TrimSuffix(samples.String(), ",")))
 			if !verdict.Approved {
 				log.Printf("GenerateVideoScript attempt %d/%d: supervisor rejected script: %s", attempt, maxAttempts, verdict.Feedback)
 				lastErr = fmt.Errorf("supervisor rejeitou o roteiro: %s", verdict.Feedback)

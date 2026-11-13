@@ -25,7 +25,7 @@ func main() {
 	var persistedSettings models.AppSettings
 	if err := db.DB.First(&persistedSettings, "id = ?", models.SettingsRowID).Error; err == nil {
 		config.ApplySettingsOverride(persistedSettings.OpenAIAPIKey, persistedSettings.GeminiAPIKey, persistedSettings.ElevenLabsAPIKey,
-			persistedSettings.YouTubeClientID, persistedSettings.YouTubeClientSec, persistedSettings.TikTokClientID, persistedSettings.TikTokClientSec)
+			persistedSettings.PexelsAPIKey, persistedSettings.YouTubeClientID, persistedSettings.YouTubeClientSec, persistedSettings.TikTokClientID, persistedSettings.TikTokClientSec)
 	}
 
 	// Ensure media folder exists and create subfolders

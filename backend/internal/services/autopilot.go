@@ -223,7 +223,7 @@ Com base nesses dados de tendências ao vivo e retenção, escolha o assunto do 
 REGRA OBRIGATÓRIA: o assunto deve ser inédito - nunca repita um tema da lista de vídeos já criados. Retorne apenas o assunto em texto simples.`,
 		channel.Name, channel.Niche, avgCTR, avgRetention, topPerformingTopic, trendsSummary, existingTitles)
 
-	nextTopic, err := CallLLM(channel.ID, videoID, prompt)
+	nextTopic, err := CallLLMText(channel.ID, videoID, prompt)
 	nextTopic = strings.Trim(strings.TrimSpace(nextTopic), "\"")
 	if err != nil || nextTopic == "" {
 		if len(liveTrends) > 0 {

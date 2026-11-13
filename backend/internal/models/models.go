@@ -69,6 +69,7 @@ type AppSettings struct {
 	OpenAIAPIKey     string    `json:"-"`
 	GeminiAPIKey     string    `json:"-"`
 	ElevenLabsAPIKey string    `json:"-"`
+	PexelsAPIKey     string    `json:"-"`
 	YouTubeClientID  string    `json:"-"`
 	YouTubeClientSec string    `json:"-"`
 	TikTokClientID   string    `json:"-"`

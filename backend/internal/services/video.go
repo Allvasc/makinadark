@@ -170,12 +170,11 @@ func CompileVideo(videoID string) {
 				visualPath = ensureLocalFile(scene.ImagePath, "image", fmt.Sprintf("%s_%d", video.ID, i))
 				isImage = true
 			}
+			var fallbackErr error
 			if visualPath == "" {
-				// Fallback local video - no real asset was available for this scene.
+				// Fallback asset - no real scene visual was available or reachable.
 				degraded = true
-				fallbackURL := getFallbackStockVideoURL(false)
-				visualPath = ensureLocalFile(fallbackURL, "video", fmt.Sprintf("fallback_%s_%d", video.ID, i))
-				isImage = false
+				visualPath, isImage, fallbackErr = resolveFallbackVisual(video.ID, i)
 			}
 
 			// 2. Prepare local audio asset
@@ -195,6 +194,27 @@ func CompileVideo(videoID string) {
 
 			// Create segment filepath
 			segmentPath := filepath.Join("media", "temp", fmt.Sprintf("seg_%s_%d.mp4", video.ID, i))
+
+			if fallbackErr != nil || visualPath == "" {
+				if fallbackErr == nil {
+					fallbackErr = fmt.Errorf("missing visual asset path")
+				}
+				log.Printf("Fallback visual error (Scene %d): %v", i+1, fallbackErr)
+				dbMu.Lock()
+				scene.Duration = duration
+				scene.Degraded = degraded
+				db.DB.Save(&scene)
+				doneCount++
+				updateRenderProgress(video.ID, progressPercent(doneCount, totalSteps), fmt.Sprintf("Renderizando cena %d de %d", doneCount, len(video.Scenes)))
+				dbMu.Unlock()
+				results[i] = sceneResult{
+					segmentPath: segmentPath,
+					duration:    duration,
+					degraded:    degraded,
+					err:         fmt.Errorf("failed to generate scene segment %d: %w", i+1, fallbackErr),
+				}
+				return
+			}
 
 			// Scale and crop filter with Ken Burns zoompan effect on all scenes (images and videos)
 			fps := 25.0
@@ -800,6 +820,44 @@ func generateSilentAudio(destPath string, duration float64) error {
 		destPath,
 	)
 	return cmd.Run()
+}
+
+// resolveFallbackVisual guarantees a non-empty local visual file when a scene
+// has no generated image/clip. External stock fallback URLs (e.g. Mixkit) can
+// return HTTP 403, so when downloading fails we synthesize a local 1920x1080
+// dark frame via FFmpeg instead of handing "" to ffmpeg (exit status 254).
+func resolveFallbackVisual(videoID string, sceneIdx int) (path string, isImage bool, err error) {
+	if fallbackURL := getFallbackStockVideoURL(false); fallbackURL != "" {
+		if local := ensureLocalFile(fallbackURL, "video", fmt.Sprintf("fallback_%s_%d", videoID, sceneIdx)); local != "" {
+			return local, false, nil
+		}
+	}
+	fallbackImg := filepath.Join("media", "temp", fmt.Sprintf("fallback_img_%s_%d.png", videoID, sceneIdx))
+	if err := generateFallbackFrame(fallbackImg); err != nil {
+		return "", true, err
+	}
+	return fallbackImg, true, nil
+}
+
+func generateFallbackFrame(destPath string) error {
+	if fileExists(destPath) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return err
+	}
+	cmd := exec.Command("ffmpeg", "-y",
+		"-f", "lavfi",
+		"-i", "color=c=#0b0f17:s=1920x1080:d=1",
+		"-vf", "vignette=PI/4",
+		"-frames:v", "1",
+		"-update", "1",
+		destPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ffmpeg fallback frame failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func ensureLocalFile(urlOrPath, category, tempID string) string {
